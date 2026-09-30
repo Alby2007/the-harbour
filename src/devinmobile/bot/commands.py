@@ -1,12 +1,15 @@
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 
+from ..acp_bridge import MODEL_ALIASES, BridgeError
 from ..db import Binding
 from ..devin_client import SESSION_TAG
 from ..embeds import status_embed
+from ..models import Session
 from ..views import SessionView
 
 if TYPE_CHECKING:
@@ -17,6 +20,15 @@ log = logging.getLogger(__name__)
 DEVIN_MODES = ["lite", "normal", "fast", "ultra", "fusion"]
 
 NOT_ALLOWED = "This bot is locked to its owner."
+
+
+async def model_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    cur = current.lower()
+    return [
+        app_commands.Choice(name=a, value=a) for a in MODEL_ALIASES if cur in a
+    ][:25]
 
 
 def register_commands(bot: "DevinMobileBot") -> None:
@@ -33,20 +45,35 @@ def register_commands(bot: "DevinMobileBot") -> None:
         )
         return chan if isinstance(chan, discord.TextChannel) else None
 
+    async def _wait_for_v3(session_id: str) -> Session:
+        """Bridge sessions materialize for the v3 API once the first prompt
+        lands — poll briefly until get_session succeeds."""
+        last: Exception | None = None
+        for _ in range(8):
+            try:
+                return await bot.devin.get_session(session_id)
+            except Exception as e:  # noqa: BLE001 — any HTTP error just means "not yet"
+                last = e
+                await asyncio.sleep(2.5)
+        raise BridgeError(f"session {session_id} not visible to the API yet") from last
+
     @tree.command(name="devin", description="Start a Devin Cloud session")
     @app_commands.describe(
         prompt="What Devin should do",
         repo="org/repo (comma-separate for several)",
         mode="Agent mode (default from env)",
+        model="Model picker (e.g. swe2-max, opus, fusion) — overrides mode",
         title="Thread/session title",
     )
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in DEVIN_MODES])
+    @app_commands.autocomplete(model=model_autocomplete)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def devin_cmd(
         interaction: discord.Interaction,
         prompt: str,
         repo: str | None = None,
         mode: str | None = None,
+        model: str | None = None,
         title: str | None = None,
     ) -> None:
         if not _allowed(interaction):
@@ -58,20 +85,51 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 "HUB_CHANNEL_ID is not configured or isn't a text channel.", ephemeral=True
             )
             return
+        repos = [r.strip() for r in repo.split(",") if r.strip()] if repo else None
         await interaction.response.defer()
-        try:
-            session = await bot.devin.create_session(
-                prompt=prompt,
-                repos=[r.strip() for r in repo.split(",") if r.strip()] if repo else None,
-                devin_mode=mode or bot.settings.devin_mode,
-                title=title,
-                tags=[SESSION_TAG],
-                max_acu_limit=bot.settings.max_acu_limit,
-                create_as_user_id=bot.settings.create_as_user_id,
-            )
-        except Exception as e:
-            await interaction.followup.send(f"Session create failed: `{e}`", ephemeral=True)
-            return
+
+        model_label: str | None = None
+        if model:
+            # Model selection needs the ACP bridge (CLI credentials); v3 only
+            # exposes devin_mode. The bridge session joins the normal pipeline
+            # once its first prompt lands.
+            if not bot.bridge.available:
+                await interaction.followup.send(
+                    "Model selection needs `devin auth login` on the bot host "
+                    "(no CLI credentials found). Run without `model:` or log in first.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                bs = await bot.bridge.create_cloud_session(
+                    prompt, model=model, repos=repos
+                )
+                session = await _wait_for_v3(bs.session_id)
+                model_label = bs.model_label
+            except BridgeError as e:
+                await interaction.followup.send(f"Bridge create failed: `{e}`", ephemeral=True)
+                return
+            except Exception as e:
+                await interaction.followup.send(
+                    f"Session create failed: `{e}`", ephemeral=True
+                )
+                return
+        else:
+            try:
+                session = await bot.devin.create_session(
+                    prompt=prompt,
+                    repos=repos,
+                    devin_mode=mode or bot.settings.devin_mode,
+                    title=title,
+                    tags=[SESSION_TAG],
+                    max_acu_limit=bot.settings.max_acu_limit,
+                    create_as_user_id=bot.settings.create_as_user_id,
+                )
+            except Exception as e:
+                await interaction.followup.send(
+                    f"Session create failed: `{e}`", ephemeral=True
+                )
+                return
 
         thread_name = (title or prompt)[:90] or session.session_id
         thread = await hub.create_thread(
@@ -82,7 +140,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         except discord.HTTPException:
             pass
         anchor = await thread.send(
-            embed=status_embed(session, fallback_title=title),
+            embed=status_embed(session, fallback_title=title, model=model_label),
             view=SessionView(session.session_id, session.url, bot.handle_component),
         )
         await bot.db.upsert_binding(
@@ -95,6 +153,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 url=session.url,
                 status=session.status,
                 status_detail=session.status_detail,
+                model=model_label,
             )
         )
         await interaction.followup.send(f"Session started → {thread.mention}")

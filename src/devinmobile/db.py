@@ -17,9 +17,13 @@ CREATE TABLE IF NOT EXISTS bindings (
     msg_cursor     TEXT,
     seen_event_ids TEXT NOT NULL DEFAULT '[]',
     active         INTEGER NOT NULL DEFAULT 1,
+    model          TEXT,
     created_at     INTEGER NOT NULL
 );
 """
+
+# Columns added after the initial schema — keyed by column name.
+MIGRATIONS = {"model": "ALTER TABLE bindings ADD COLUMN model TEXT"}
 
 # How many event ids to keep for replay dedupe.
 SEEN_CAP = 500
@@ -38,6 +42,7 @@ class Binding:
     msg_cursor: str | None = None
     seen_event_ids: set[str] = field(default_factory=set)
     active: bool = True
+    model: str | None = None
     created_at: int = 0
 
 
@@ -49,6 +54,11 @@ class Database:
     async def connect(cls, path: str) -> "Database":
         conn = await aiosqlite.connect(path)
         await conn.executescript(SCHEMA)
+        async with conn.execute("PRAGMA table_info(bindings)") as cur:
+            cols = {r[1] for r in await cur.fetchall()}
+        for col, ddl in MIGRATIONS.items():
+            if col not in cols:
+                await conn.execute(ddl)
         await conn.commit()
         return cls(conn)
 
@@ -69,7 +79,8 @@ class Database:
             msg_cursor=row[8],
             seen_event_ids=set(json.loads(row[9])),
             active=bool(row[10]),
-            created_at=row[11],
+            model=row[12] if len(row) > 12 else None,
+            created_at=row[13] if len(row) > 13 else 0,
         )
 
     async def upsert_binding(self, b: Binding) -> None:
@@ -78,19 +89,21 @@ class Database:
         await self._conn.execute(
             """INSERT INTO bindings
                (session_id, thread_id, channel_id, anchor_msg_id, title, url,
-                status, status_detail, msg_cursor, seen_event_ids, active, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                status, status_detail, msg_cursor, seen_event_ids, active, model,
+                created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
                  url=excluded.url, status=excluded.status,
                  status_detail=excluded.status_detail, msg_cursor=excluded.msg_cursor,
-                 seen_event_ids=excluded.seen_event_ids, active=excluded.active""",
+                 seen_event_ids=excluded.seen_event_ids, active=excluded.active,
+                 model=excluded.model""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
                 json.dumps(sorted(b.seen_event_ids)[-SEEN_CAP:]),
-                int(b.active), b.created_at,
+                int(b.active), b.model, b.created_at,
             ),
         )
         await self._conn.commit()

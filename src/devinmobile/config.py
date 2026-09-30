@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     db_path: str = "devinmobile.db"
     poll_interval_seconds: float = 15.0
 
+    # ACP bridge (model-selected cloud sessions). Written by `devin auth login`.
+    devin_credentials_path: str = "~/.local/share/devin/credentials.toml"
+    devin_api_url_override: str | None = None  # e.g. for staging/enterprise hosts
+    bridge_timeout: float = 60.0
+
     @cached_property
     def allowed_user_id_set(self) -> frozenset[int]:
         return frozenset(int(x) for x in self.allowed_user_ids.split(",") if x.strip())

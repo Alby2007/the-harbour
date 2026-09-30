@@ -4,6 +4,7 @@ import logging
 import discord
 from discord import app_commands
 
+from ..acp_bridge import AcpBridge
 from ..config import Settings
 from ..db import Database
 from ..devin_client import DevinClient
@@ -24,6 +25,7 @@ class DevinMobileBot(discord.Client):
         self.settings = settings
         self.db: Database
         self.devin: DevinClient
+        self.bridge: AcpBridge
         self.relay: Relay
         self._relay_task: asyncio.Task | None = None
 
@@ -34,6 +36,17 @@ class DevinMobileBot(discord.Client):
             self.settings.devin_org_id,
             self.settings.devin_base_url,
         )
+        self.bridge = AcpBridge(
+            self.settings.devin_credentials_path,
+            api_url=self.settings.devin_api_url_override,
+            timeout=self.settings.bridge_timeout,
+        )
+        if not self.bridge.available:
+            log.warning(
+                "no CLI credentials at %s — the model: option on /devin is disabled "
+                "until `devin auth login` runs on this host",
+                self.settings.devin_credentials_path,
+            )
         self.relay = Relay(self, self.devin, self.db, self.settings)
         register_commands(self)
         if self.settings.command_guild_id:

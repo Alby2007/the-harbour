@@ -6,6 +6,9 @@ services:
       DB_PATH: /data/devinmobile.db
     volumes:
       - devinmobile-data:/data
+      # Optional: mount CLI credentials for the `model:` option (ACP bridge).
+      # Create on the host with `devin auth login`, then uncomment:
+      # - ${HOME}/.local/share/devin/credentials.toml:/home/app/.local/share/devin/credentials.toml:ro
     restart: unless-stopped
 
 volumes:

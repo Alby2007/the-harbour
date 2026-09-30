@@ -15,7 +15,12 @@ STATUS_COLORS = {
 _FIELD_LIMIT = 1000
 
 
-def status_embed(session: Session, *, fallback_title: str | None = None) -> discord.Embed:
+def status_embed(
+    session: Session,
+    *,
+    fallback_title: str | None = None,
+    model: str | None = None,
+) -> discord.Embed:
     title = session.title or fallback_title or session.session_id
     embed = discord.Embed(
         title=title[:100],
@@ -25,6 +30,8 @@ def status_embed(session: Session, *, fallback_title: str | None = None) -> disc
     detail = f" — `{session.status_detail}`" if session.status_detail else ""
     embed.add_field(name="Status", value=f"`{session.status}`{detail}", inline=False)
     bits = []
+    if model:
+        bits.append(f"model `{model}`")
     if session.devin_mode:
         bits.append(f"mode `{session.devin_mode}`")
     bits.append(f"{session.acus_consumed:g} ACUs")
