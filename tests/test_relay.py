@@ -50,19 +50,43 @@ def test_transition_exit_notifies_complete():
     assert n and n.kind == "complete"
 
 
-def test_transition_waiting_for_user():
+def test_transition_waiting_for_user_plain_turn_end():
+    # task done, no question asked -> "turn ended", not "asking for input"
+    n = classify_transition(
+        "running", "working", make_session("running", "waiting_for_user"),
+        last_devin_msg="Created and ran the script successfully.",
+    )
+    assert n and n.kind == "turn_end" and n.mention
+    assert "finished its turn" in n.text
+
+
+def test_transition_waiting_for_user_question():
+    n = classify_transition(
+        "running", "working", make_session("running", "waiting_for_user"),
+        last_devin_msg="I found two config files — which one should I use?",
+    )
+    assert n and n.kind == "input" and n.mention
+    assert "which one should I use?" in n.text
+
+
+def test_transition_waiting_for_user_no_message():
     n = classify_transition("running", "working", make_session("running", "waiting_for_user"))
-    assert n and n.kind == "input"
+    assert n and n.kind == "turn_end"
 
 
 def test_transition_waiting_for_approval():
     n = classify_transition("running", "working", make_session("running", "waiting_for_approval"))
-    assert n and n.kind == "approval"
+    assert n and n.kind == "approval" and n.mention
+
+
+def test_transition_suspended_inactivity_is_quiet():
+    n = classify_transition("running", "waiting_for_user", make_session("suspended", "inactivity"))
+    assert n and n.kind == "suspended" and not n.mention
 
 
 def test_transition_suspended_carries_reason():
     n = classify_transition("running", "working", make_session("suspended", "out_of_credits"))
-    assert n and n.kind == "suspended" and "out_of_credits" in n.text
+    assert n and n.kind == "suspended" and n.mention and "out_of_credits" in n.text
 
 
 def test_no_repeat_ping_when_detail_unchanged():

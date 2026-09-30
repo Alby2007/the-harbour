@@ -66,12 +66,21 @@ def relayable(items: list[SessionMessage], seen: set[str]) -> list[SessionMessag
 
 @dataclass
 class Notification:
-    kind: str  # input | approval | complete | suspended | error
+    kind: str  # input | turn_end | approval | complete | suspended | error
     text: str
+    mention: bool = True
+
+
+# status_details on suspend that are routine — the tail of a finished turn,
+# not something worth a phone push.
+QUIET_SUSPEND_REASONS = {"inactivity", "user_request"}
 
 
 def classify_transition(
-    old_status: str | None, old_detail: str | None, session: Session
+    old_status: str | None,
+    old_detail: str | None,
+    session: Session,
+    last_devin_msg: str | None = None,
 ) -> Notification | None:
     s, d = session.status, session.status_detail
     if s != old_status:
@@ -80,12 +89,32 @@ def classify_transition(
         if s == "error":
             return Notification("error", "Session errored.")
         if s == "suspended":
-            return Notification("suspended", f"Session suspended ({d or 'no reason'}).")
+            if d in QUIET_SUSPEND_REASONS or d is None:
+                return Notification(
+                    "suspended",
+                    f"Session suspended ({d or 'no reason'}) — reply here to resume it.",
+                    mention=False,
+                )
+            return Notification(
+                "suspended", f"Session suspended ({d}) — needs attention."
+            )
     if d != old_detail:
         if d == "waiting_for_user":
-            return Notification("input", "Devin is asking for input.")
+            # fires on every turn end — only call it "asking" when the last
+            # message really is a question
+            if last_devin_msg and last_devin_msg.rstrip().endswith("?"):
+                excerpt = last_devin_msg.strip()[-240:]
+                return Notification("input", f"Devin is asking: “{excerpt}”")
+            return Notification(
+                "turn_end", "Devin finished its turn — reply here to continue."
+            )
         if d == "waiting_for_approval":
-            return Notification("approval", "Devin is waiting for an approval.")
+            return Notification(
+                "approval",
+                "Devin needs an approval — tap Approve or open the session.",
+            )
+        if d == "finished":
+            return Notification("complete", "Session finished.")
     return None
 
 
@@ -112,9 +141,13 @@ class Relay:
 
     async def poll_binding(self, binding: Binding) -> None:
         cursor = binding.msg_cursor
+        last_devin: str | None = None
         while True:
             page = await self.devin.list_messages(binding.session_id, after=cursor)
             for m in relayable(page.items, binding.seen_event_ids):
+                clean, _ = extract_attachments(m.message or "")
+                if clean:
+                    last_devin = clean
                 await self._relay_message(binding, m)
             if page.end_cursor:
                 cursor = page.end_cursor
@@ -123,7 +156,9 @@ class Relay:
         binding.msg_cursor = cursor
 
         session = await self.devin.get_session(binding.session_id)
-        notif = classify_transition(binding.status, binding.status_detail, session)
+        notif = classify_transition(
+            binding.status, binding.status_detail, session, last_devin
+        )
         if session.title:
             binding.title = session.title
         binding.status = session.status
@@ -175,7 +210,11 @@ class Relay:
         embed_fn = completion_embed if complete else status_embed
         try:
             anchor = await thread.fetch_message(binding.anchor_msg_id)
-            await anchor.edit(embed=embed_fn(session, fallback_title=binding.title))
+            await anchor.edit(
+                embed=embed_fn(
+                    session, fallback_title=binding.title, model=binding.model
+                )
+            )
         except discord.HTTPException:
             log.warning("anchor edit failed for %s", binding.session_id)
 
@@ -185,9 +224,20 @@ class Relay:
         thread = await self._thread(binding)
         if thread is None:
             return
-        mentions = " ".join(f"<@{u}>" for u in self.settings.allowed_user_id_set)
-        text = f"{mentions} {notif.text}"
+        # No mention => no push notification: routine transitions stay readable
+        # in-channel without buzzing the phone.
+        mentions = (
+            " ".join(f"<@{u}>" for u in self.settings.allowed_user_id_set) + " "
+            if notif.mention
+            else ""
+        )
+        text = mentions + notif.text
         if notif.kind == "complete":
-            await thread.send(text, embed=completion_embed(session, fallback_title=binding.title))
+            await thread.send(
+                text,
+                embed=completion_embed(
+                    session, fallback_title=binding.title, model=binding.model
+                ),
+            )
         else:
             await thread.send(text)

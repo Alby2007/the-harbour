@@ -42,8 +42,13 @@ def status_embed(
     return embed
 
 
-def completion_embed(session: Session, *, fallback_title: str | None = None) -> discord.Embed:
-    embed = status_embed(session, fallback_title=fallback_title)
+def completion_embed(
+    session: Session,
+    *,
+    fallback_title: str | None = None,
+    model: str | None = None,
+) -> discord.Embed:
+    embed = status_embed(session, fallback_title=fallback_title, model=model)
     out = session.structured_output or {}
     summary = out.get("summary")
     if summary:
