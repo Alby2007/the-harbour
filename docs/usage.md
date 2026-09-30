@@ -13,7 +13,11 @@ Creates a session and its thread.
 | `prompt` | required | The task, verbatim — it's the first user message to Devin |
 | `model` | optional, autocomplete | Real model picker: `swe2-max`, `opus`, `ultra`, `fusion`, `lite`, `gpt-6.1`, … Free text is fuzzy-matched against the server's live catalog; unknown values error back with the valid list |
 | `repo` | optional | `owner/repo`, comma-separate for several |
-| `mode` | optional | v3 `devin_mode` tier — `lite`/`normal`/`fast`/`ultra`/`fusion`. Ignored when `model:` is set (the model select supersedes it) |
+| `mode` | optional | v3 `devin_mode` tier — `lite`/`normal`/`fast`/`ultra`/`fusion`. Ignored when `model:` is set (the model select supersedes it). Beats `DEVIN_DEFAULT_MODEL` when passed explicitly |
+
+`DEVIN_DEFAULT_MODEL` (env) applies a model to every `/devin` call that passes
+neither `model:` nor `mode:`. Option order in Discord is fixed — required
+first — so `prompt` always leads; `model` is the first optional chip.
 | `title` | optional | Thread/session title; defaults to the prompt |
 
 `model:` sessions are created over the ACP bridge as *your* Devin user (see

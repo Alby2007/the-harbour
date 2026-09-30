@@ -60,9 +60,9 @@ def register_commands(bot: "DevinMobileBot") -> None:
     @tree.command(name="devin", description="Start a Devin Cloud session")
     @app_commands.describe(
         prompt="What Devin should do",
+        model="Model picker (e.g. swe2-max, opus, fusion) — overrides mode",
         repo="org/repo (comma-separate for several)",
         mode="Agent mode (default from env)",
-        model="Model picker (e.g. swe2-max, opus, fusion) — overrides mode",
         title="Thread/session title",
     )
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in DEVIN_MODES])
@@ -71,9 +71,9 @@ def register_commands(bot: "DevinMobileBot") -> None:
     async def devin_cmd(
         interaction: discord.Interaction,
         prompt: str,
+        model: str | None = None,
         repo: str | None = None,
         mode: str | None = None,
-        model: str | None = None,
         title: str | None = None,
     ) -> None:
         if not _allowed(interaction):
@@ -89,7 +89,9 @@ def register_commands(bot: "DevinMobileBot") -> None:
         await interaction.response.defer()
 
         model_label: str | None = None
-        if model:
+        # model beats mode; the env default only applies when neither is given
+        effective_model = model or (bot.settings.default_model if mode is None else None)
+        if effective_model:
             # Model selection needs the ACP bridge (CLI credentials); v3 only
             # exposes devin_mode. The bridge session joins the normal pipeline
             # once its first prompt lands.
@@ -102,7 +104,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 return
             try:
                 bs = await bot.bridge.create_cloud_session(
-                    prompt, model=model, repos=repos
+                    prompt, model=effective_model, repos=repos
                 )
                 session = await _wait_for_v3(bs.session_id)
                 model_label = bs.model_label

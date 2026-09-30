@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # Devin session defaults
     devin_mode: str = "lite"
+    default_model: str | None = None  # bridge model alias/value; None = server default
     max_acu_limit: int | None = 25
     create_as_user_id: str | None = None
 
