@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import random
+import re
 from dataclasses import dataclass
 
 import discord
@@ -30,6 +32,25 @@ def chunk_text(text: str, limit: int = DISCORD_MSG_LIMIT) -> list[str]:
     if text:
         chunks.append(text)
     return chunks
+
+
+ATTACHMENT_RE = re.compile(r"ATTACHMENT:(\{[^\n]*\})")
+
+
+def extract_attachments(text: str) -> tuple[str, list[str]]:
+    """Split Devin's inline `ATTACHMENT:{json}` markers off the message text."""
+    urls: list[str] = []
+
+    def repl(m: re.Match) -> str:
+        try:
+            url = json.loads(m.group(1)).get("url")
+            if url:
+                urls.append(url)
+        except ValueError:
+            pass
+        return ""
+
+    return ATTACHMENT_RE.sub(repl, text).strip(), urls
 
 
 def relayable(items: list[SessionMessage], seen: set[str]) -> list[SessionMessage]:
@@ -134,11 +155,14 @@ class Relay:
         if thread is None:
             log.warning("no thread %s for %s", binding.thread_id, binding.session_id)
             return
-        text = m.message or ""
-        chunks = chunk_text(text)
+        text, attachments = extract_attachments(m.message or "")
+        chunks = chunk_text(text) if text else []
         for i, chunk in enumerate(chunks[:8]):
             suffix = "\n… *(truncated — see session)*" if i == 7 and len(chunks) > 8 else ""
             await thread.send(chunk + suffix)
+        for url in attachments:
+            name = url.rsplit("/", 1)[-1] or "attachment"
+            await thread.send(f"Attachment: [{name}]({url})")
 
     async def _update_anchor(
         self, binding: Binding, session: Session, *, complete: bool = False

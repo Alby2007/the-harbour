@@ -43,6 +43,10 @@ class DevinMobileBot(discord.Client):
         await self.tree.sync()  # global: makes commands usable in DMs
         self._relay_task = asyncio.create_task(self.relay.run_forever())
 
+    async def on_ready(self) -> None:
+        assert self.user is not None
+        log.info("online as %s (%s)", self.user, self.user.id)
+
     async def close(self) -> None:
         if self._relay_task:
             self._relay_task.cancel()

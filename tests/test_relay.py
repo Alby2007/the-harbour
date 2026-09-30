@@ -1,5 +1,10 @@
 from devinmobile.models import Session, SessionMessage
-from devinmobile.relay import chunk_text, classify_transition, relayable
+from devinmobile.relay import (
+    chunk_text,
+    classify_transition,
+    extract_attachments,
+    relayable,
+)
 
 
 def make_msg(event_id: str, source: str = "devin", text: str = "x") -> SessionMessage:
@@ -72,3 +77,19 @@ def test_first_poll_no_notify_for_steady_state():
 def test_error_transition():
     n = classify_transition("running", "working", make_session("error"))
     assert n and n.kind == "error"
+
+
+def test_extract_attachments():
+    text = (
+        'Done.\n\nATTACHMENT:{"url":"https://app.devin.ai/attachments/u-u/fib.py",'
+        '"fileSize":177}'
+    )
+    clean, urls = extract_attachments(text)
+    assert clean == "Done."
+    assert urls == ["https://app.devin.ai/attachments/u-u/fib.py"]
+
+
+def test_extract_attachments_plain_text_unchanged():
+    clean, urls = extract_attachments("no attachments here")
+    assert clean == "no attachments here"
+    assert urls == []
