@@ -44,12 +44,39 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   Tradeoff vs v3 create: no `tags`, `structured_output_schema`, or
   `max_acu_limit` on bridge sessions. `resolve_option` fuzzy-matches a free
   string to the advertised option values (MODEL_ALIASES for known names).
-- `views.py` — stateless `dvm:{action}:{session_id}` custom_ids; `_INFLIGHT`
-  dedupes the double-dispatch between a live View callback and
+- `views.py` — stateless `dvm:{action}:{session_id}[:{extra}]` custom_ids;
+  `_INFLIGHT` dedupes the double-dispatch between a live View callback and
   `Client.on_interaction` (Stockbot chart_view.py pattern). Buttons: Open
   (link), Refresh, Approve (sends "Approved — please proceed." via messages
   API), SSH (ephemeral `ssh <id>@ssh.devin.ai` string — Cognition's gateway,
-  no tunneling needed).
+  no tunneling needed). PR cards add `pr_merge`/`pr_merge_go`/`pr_approve`/
+  `pr_close` — `extra` carries the PR number.
+- `github_client.py` — GitHub App client (optional). RS256 JWT from the app
+  PEM → `POST /app/installations/{id}/access_tokens` → cached token (~55min
+  TTL, 5min refresh margin). `parse_pr_url`/`parse_issue_ref`/`checks_state`
+  are pure helpers. `checks_state` collapses check runs: any completed
+  failure beats in-progress; skipped/neutral don't block success.
+- `db.py` `prs` table — `(session_id, pr_url)` PK; `card_msg_id` (the posted
+  card), `last_notified` (`"{state}|{checks}"` — notify once per distinct
+  outcome), `binding_for_pr` joins back for webhook routing. Upsert is
+  state-tolerant: NULLIF/CASE guards keep a state-only update from wiping
+  owner/repo/number.
+- `relay.py` PR path — `_sync_prs` runs inside `poll_binding`: discovers
+  `session.pull_requests` (v3 field), posts one card per new PR
+  (`_post_pr_card`), then `_poll_pr` diffs `(state, checks)` against
+  `last_notified` and posts/mentions on transitions; `_refresh_pr_card`
+  edits the card embed in place.
+- `webhook_server.py` — optional aiohttp receiver on
+  `GITHUB_WEBHOOK_PORT`/`/github`, only when `GITHUB_WEBHOOK_SECRET` is set.
+  HMAC-SHA256 verify → `pull_request`/`check_run`/`check_suite` →
+  `binding_for_pr` lookup → thread post. Untracked PRs are ignored. Polling
+  converges on the same state, so this is a latency nicety, not a
+  requirement.
+- `/devin issue:`/branch:` — `issue` accepts URL / `owner/repo#n` / bare
+  `#n` (resolved against `repo:`); title+body are fetched via the App and
+  appended to the prompt, and the title defaults the thread name. `branch`
+  adds a "checkout from origin/{branch}" prompt line — it's a prompt
+  instruction, not a repo checkout on our side.
 
 ## Non-obvious constraints
 

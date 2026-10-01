@@ -8,10 +8,12 @@ from dataclasses import dataclass
 import discord
 
 from .config import Settings
-from .db import Binding, Database
+from .db import Binding, Database, PrRow
 from .devin_client import DevinClient
-from .embeds import completion_embed, status_embed
+from .embeds import completion_embed, pr_embed, status_embed
+from .github_client import GithubClient, PullRef, parse_pr_url
 from .models import Session, SessionMessage
+from .views import ComponentHandler, PRView
 
 log = logging.getLogger(__name__)
 
@@ -120,12 +122,20 @@ def classify_transition(
 
 class Relay:
     def __init__(
-        self, bot: discord.Client, devin: DevinClient, db: Database, settings: Settings
+        self,
+        bot: discord.Client,
+        devin: DevinClient,
+        db: Database,
+        settings: Settings,
+        github: "GithubClient | None" = None,
+        component_handler: "ComponentHandler | None" = None,
     ) -> None:
         self.bot = bot
         self.devin = devin
         self.db = db
         self.settings = settings
+        self.github = github
+        self._component_handler = component_handler
 
     async def run_forever(self) -> None:
         while True:
@@ -156,6 +166,7 @@ class Relay:
         binding.msg_cursor = cursor
 
         session = await self.devin.get_session(binding.session_id)
+        await self._sync_prs(binding, session)
         notif = classify_transition(
             binding.status, binding.status_detail, session, last_devin
         )
@@ -171,6 +182,111 @@ class Relay:
         if session.status in QUIET_STATUSES:
             binding.active = False
         await self.db.upsert_binding(binding)
+
+    # ---- PR tracking -------------------------------------------------------
+
+    async def _sync_prs(self, binding: Binding, session: Session) -> None:
+        """Discover PRs from the v3 session payload; post a card once per PR,
+        then poll state/CI each tick for notification transitions."""
+        for pr in session.pull_requests:
+            row = await self.db.get_pr(binding.session_id, pr.pr_url)
+            ref = parse_pr_url(pr.pr_url)
+            if row is None:
+                row = PrRow(
+                    session_id=binding.session_id,
+                    pr_url=pr.pr_url,
+                    owner=ref.owner if ref else "",
+                    repo=ref.repo if ref else "",
+                    number=ref.number if ref else 0,
+                    state=pr.pr_state or "open",
+                )
+                await self.db.upsert_pr(row)
+                await self._post_pr_card(binding, row)
+            if self.github is not None and ref and row.state not in (
+                "merged", "closed"
+            ):
+                await self._poll_pr(binding, row, ref)
+
+    async def _post_pr_card(self, binding: Binding, row: PrRow) -> None:
+        thread = await self._thread(binding)
+        if thread is None or not row.number:
+            return
+        if self.github is not None:
+            try:
+                data = await self.github.get_pr(
+                    PullRef(owner=row.owner, repo=row.repo, number=row.number)
+                )
+                row.pr_title = data.get("title")
+                row.checks_state = await self.github.get_checks(
+                    PullRef(owner=row.owner, repo=row.repo, number=row.number)
+                )
+            except Exception:  # noqa: BLE001 — card still posts without details
+                log.warning("PR detail fetch failed for %s", row.pr_url)
+        card = await thread.send(
+            embed=pr_embed(
+                owner=row.owner, repo=row.repo, number=row.number,
+                pr_title=row.pr_title, state=row.state,
+                checks=row.checks_state, url=row.pr_url,
+            ),
+            view=(
+                PRView(binding.session_id, row.number, row.pr_url,
+                       self._component_handler)
+                if self._component_handler
+                else discord.utils.MISSING
+            ),
+        )
+        row.card_msg_id = card.id
+        await self.db.upsert_pr(row)
+
+    async def _poll_pr(self, binding: Binding, row: PrRow, ref: PullRef) -> None:
+        try:
+            data = await self.github.get_pr(ref)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 — transient GitHub errors are skippable
+            log.warning("PR poll failed for %s", row.pr_url)
+            return
+        state = "merged" if data.get("merged") else data.get("state", row.state)
+        checks = await self.github.get_checks(ref)  # type: ignore[union-attr]
+        row.pr_title = data.get("title") or row.pr_title
+
+        # Composite transition key — notify once per distinct outcome.
+        key = f"{state}|{checks}"
+        if key == row.last_notified:
+            row.state, row.checks_state = state, checks
+            await self.db.upsert_pr(row)
+            return
+        thread = await self._thread(binding)
+        if thread is not None:
+            mention = " ".join(
+                f"<@{u}>" for u in self.settings.allowed_user_id_set
+            )
+            label = f"PR #{row.number}"
+            if state == "merged":
+                await thread.send(f"{label} merged 🟣")
+            elif state == "closed" and row.state != "closed":
+                await thread.send(f"{label} closed.")
+            elif checks == "success" and row.checks_state != "success":
+                await thread.send(f"{mention} {label} — CI green ✅")
+            elif checks == "failure" and row.checks_state != "failure":
+                await thread.send(f"{mention} {label} — CI failing ❌")
+        row.state, row.checks_state, row.last_notified = state, checks, key
+        await self.db.upsert_pr(row)
+        await self._refresh_pr_card(binding, row)
+
+    async def _refresh_pr_card(self, binding: Binding, row: PrRow) -> None:
+        if not row.card_msg_id:
+            return
+        thread = await self._thread(binding)
+        if thread is None:
+            return
+        try:
+            card = await thread.fetch_message(row.card_msg_id)
+            await card.edit(embed=pr_embed(
+                owner=row.owner, repo=row.repo, number=row.number,
+                pr_title=row.pr_title, state=row.state,
+                checks=row.checks_state, url=row.pr_url,
+            ))
+        except discord.HTTPException:
+            pass
 
     async def _thread(self, binding: Binding) -> discord.Thread | None:
         chan = self.bot.get_channel(binding.thread_id) or await self.bot.fetch_channel(

@@ -17,9 +17,14 @@ Discord (phone)                    bot host                      Devin
       thread + anchor embed + sqlite binding
              │
              └──────────────  relay loop (15s) ──────────────────────> v3 GET
-                          messages cursor + status diff                    |
-             │                                                             v
+                          messages cursor + status diff +                    |
+                          pull_requests                                      v
+             │            PR card -> thread; buttons ────────> GitHub API
+             │            (merge/approve/close, CI rollup)    (App install
+             │                                               token via JWT)
              └──────────────  thread msg -> v3 POST /messages ───────> steer
+
+GitHub webhooks (optional) ──> aiohttp :PORT/github ──> prs lookup ──> thread
 ```
 
 Two APIs, one session:
@@ -40,6 +45,11 @@ Why not the bridge for everything? v3 gives us `tags`, `title`,
 sessions forgo those; they get attribution for free instead (created as the
 credential's owner).
 
+A third API exists for the PR surface: the **GitHub REST API**, authed as a
+GitHub App installation (RS256 JWT → installation token, cached). Devin
+opens PRs under its own identity — our App only needs to read PR/check
+state and perform merge/approve/close on the org's repos.
+
 ## Components
 
 | Module | Role |
@@ -47,10 +57,12 @@ credential's owner).
 | `config.py` | pydantic-settings; all config via env |
 | `devin_client.py` | async v3 client — retry/backoff on 429+5xx, typed `Session`/`MessagePage` |
 | `acp_bridge.py` | WS JSON-RPC client: credentials.toml → `session/new` → `set_config_option` → `session/prompt`; fuzzy model resolution against live `configOptions` |
-| `db.py` | `bindings` table: `session_id ↔ thread_id ↔ anchor_msg_id`, `msg_cursor`, `seen_event_ids` (dedupe), `active` flag, `model` label |
-| `relay.py` | one poll loop: drain new `source=="devin"` messages into the thread, then diff `status`/`status_detail` → notifications. `active=0` parks dead sessions; a message reactivates |
-| `embeds.py` | status + completion embeds (structured_output → summary/files/tests) |
-| `views.py` | stateless buttons (`dvm:{action}:{session_id}` custom_ids survive restarts; `_INFLIGHT` dedupes the double-dispatch with `on_interaction`) |
+| `db.py` | `bindings` table: `session_id ↔ thread_id ↔ anchor_msg_id`, `msg_cursor`, `seen_event_ids` (dedupe), `active` flag, `model` label. `prs` table: one row per (session, PR) — card msg id, last notified state, CI rollup |
+| `relay.py` | one poll loop: drain new `source=="devin"` messages into the thread, then diff `status`/`status_detail` → notifications; syncs `session.pull_requests` → PR cards and polls state/CI for transitions. `active=0` parks dead sessions; a message reactivates |
+| `github_client.py` | GitHub App client: PEM → RS256 JWT → installation token (cached ~55min); `get_pr`, `check-runs` rollup, `merge`, `approve`, `close`, `get_issue`. URL/issue-ref parsers and the checks-state reducer live here too |
+| `webhook_server.py` | optional aiohttp receiver (`POST /github`, HMAC-SHA256 verified) — `pull_request`/`check_run`/`check_suite` events routed to the owning thread via the `prs` table. Polling covers the same transitions; this only lowers latency |
+| `embeds.py` | status + completion embeds (structured_output → summary/files/tests) + `pr_embed` cards |
+| `views.py` | stateless buttons (`dvm:{action}:{session_id}[:{extra}]` custom_ids survive restarts; `_INFLIGHT` dedupes the double-dispatch with `on_interaction`). `PRView` carries the PR number in `extra`; merges get a `MergeConfirmView` ephemeral step |
 | `bot/commands.py` | `/devin` `/sessions` `/devin-status`, model autocomplete, `_wait_for_v3` materialization poll |
 | `bot/main.py` | client wiring, allowlist gate, thread→session steering (`on_message`), component dispatch |
 

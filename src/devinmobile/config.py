@@ -30,6 +30,22 @@ class Settings(BaseSettings):
     devin_api_url_override: str | None = None  # e.g. for staging/enterprise hosts
     bridge_timeout: float = 60.0
 
+    # GitHub App — powers PR cards/actions, CI status, issue intake, webhooks.
+    github_app_id: str = ""
+    github_app_private_key_path: str = ""  # PEM file, not inline
+    github_app_installation_id: str = ""
+    github_webhook_secret: str = ""  # empty = webhook receiver off
+    github_webhook_port: int = 8977
+    github_merge_method: str = "squash"  # merge | squash | rebase
+
+    @cached_property
+    def github_enabled(self) -> bool:
+        return bool(
+            self.github_app_id
+            and self.github_app_private_key_path
+            and self.github_app_installation_id
+        )
+
     @cached_property
     def allowed_user_id_set(self) -> frozenset[int]:
         return frozenset(int(x) for x in self.allowed_user_ids.split(",") if x.strip())

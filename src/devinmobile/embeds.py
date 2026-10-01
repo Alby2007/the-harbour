@@ -42,6 +42,33 @@ def status_embed(
     return embed
 
 
+CHECKS_ICONS = {"success": "✅", "failure": "❌", "pending": "🟡", "none": "—"}
+PR_STATE_ICONS = {"open": "🟢", "closed": "🔴", "merged": "🟣"}
+PR_COLORS = {"open": 0x2F9E44, "closed": 0xC92A2A, "merged": 0x845EF7}
+
+
+def pr_embed(
+    *,
+    owner: str,
+    repo: str,
+    number: int,
+    pr_title: str | None,
+    state: str | None,
+    checks: str | None,
+    url: str,
+) -> discord.Embed:
+    state = state or "open"
+    embed = discord.Embed(
+        title=f"PR #{number}: {pr_title or f'{owner}/{repo}'}"[:200],
+        url=url,
+        color=PR_COLORS.get(state, 0x8A8A8A),
+    )
+    ci = CHECKS_ICONS.get(checks or "none", "—")
+    st = PR_STATE_ICONS.get(state, "⚪")
+    embed.add_field(name="State", value=f"{st} {state} · CI {ci}", inline=True)
+    return embed
+
+
 def completion_embed(
     session: Session,
     *,

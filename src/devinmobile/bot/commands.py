@@ -9,6 +9,7 @@ from ..acp_bridge import MODEL_ALIASES, BridgeError
 from ..db import Binding
 from ..devin_client import SESSION_TAG
 from ..embeds import status_embed
+from ..github_client import parse_issue_ref
 from ..models import Session
 from ..views import SessionView
 
@@ -89,6 +90,8 @@ def register_commands(bot: "DevinMobileBot") -> None:
         prompt="What Devin should do",
         model="Model picker (e.g. swe2-max, opus, fusion) — overrides mode",
         repo="org/repo (comma-separate for several)",
+        issue="GitHub issue to attach as context (URL, owner/repo#n, or #n)",
+        branch="Base branch to work from (added to the prompt)",
         mode="Agent mode (default from env)",
         title="Thread/session title",
     )
@@ -100,6 +103,8 @@ def register_commands(bot: "DevinMobileBot") -> None:
         prompt: str,
         model: str | None = None,
         repo: str | None = None,
+        issue: str | None = None,
+        branch: str | None = None,
         mode: str | None = None,
         title: str | None = None,
     ) -> None:
@@ -113,7 +118,40 @@ def register_commands(bot: "DevinMobileBot") -> None:
             )
             return
         repos = [r.strip() for r in repo.split(",") if r.strip()] if repo else None
+        if issue and not bot.settings.github_enabled:
+            await interaction.response.send_message(
+                "`issue:` needs the GitHub App configured "
+                "(GITHUB_APP_ID / key path / installation id).", ephemeral=True
+            )
+            return
         await interaction.response.defer()
+
+        if issue:
+            default_repo = repos[0] if repos else None
+            ref = parse_issue_ref(issue, default_repo)
+            if ref is None:
+                await interaction.followup.send(
+                    f"Couldn't parse issue {issue!r} — use a URL, `owner/repo#n`, "
+                    "or `#n` together with `repo:`.", ephemeral=True
+                )
+                return
+            try:
+                assert bot.github is not None  # gated by github_enabled above
+                data = await bot.github.get_issue(*ref)
+                o, r, n = ref
+                body = (data.get("body") or "")[:4000]
+                prompt += (
+                    f"\n\n---\nGitHub issue https://github.com/{o}/{r}/issues/{n}\n"
+                    f"**{data.get('title', '')}**\n\n{body}"
+                )
+                title = title or data.get("title") or None
+            except Exception as e:  # noqa: BLE001 — surface GitHub's message
+                await interaction.followup.send(
+                    f"Issue fetch failed: `{e}`", ephemeral=True
+                )
+                return
+        if branch:
+            prompt += f"\n\nBase your work on branch `{branch}` (checkout from origin/{branch})."
 
         model_label: str | None = None
         # model beats mode; the env default only applies when neither is given

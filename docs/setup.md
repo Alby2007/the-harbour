@@ -1,7 +1,8 @@
 # Setup
 
-Three pieces of credentials: a Discord bot, a Devin service-user key, and
-(optionally, for model selection) a `devin` CLI login. Then one `.env` file.
+Credentials: a Discord bot, a Devin service-user key, and two optional
+add-ons — a `devin` CLI login (model selection) and a GitHub App (PR
+actions/CI/`issue:`). Then one `.env` file.
 
 ## 1. Discord
 
@@ -68,7 +69,37 @@ Bridge-created sessions are owned by the logged-in user directly —
 `CREATE_AS_USER_ID` is irrelevant for them. See
 [api-internals.md](api-internals.md) for how the bridge works.
 
-## 4. `.env`
+## 4. GitHub App (PR actions, CI, `issue:`)
+
+Optional — without it everything works, PRs just stay read-only links. With
+it you get PR cards with **Merge / Approve / Close** buttons, CI status in
+the cards + pings on transitions, and `/devin issue:` intake.
+
+1. <https://github.com/settings/apps> (or your org's settings) → **New
+   GitHub App**:
+   - Any name; homepage URL can be a placeholder; webhook can be left off
+     for now (polling covers transitions).
+   - **Repository permissions**: *Pull requests: Read & write*, *Contents:
+     Read & write* (merge needs it), *Issues: Read-only*, *Checks:
+     Read-only*.
+   - **Subscribe to events**: `pull_request`, `check_run`, `check_suite`
+     (only needed if you also want the webhook receiver below).
+2. **Generate a private key** → save the `.pem` next to the bot →
+   `GITHUB_APP_PRIVATE_KEY_PATH`.
+3. App page → App ID → `GITHUB_APP_ID`.
+4. **Install App** onto the account/org that owns your repos → the
+   installation page URL ends in the installation id →
+   `GITHUB_APP_INSTALLATION_ID`.
+5. Optional instant transitions: set a **webhook** on the app pointing at
+   `https://<your-host-or-tunnel>/github` with a shared secret →
+   `GITHUB_WEBHOOK_SECRET` (+ `GITHUB_WEBHOOK_PORT`, default 8977). The bot
+   verifies `X-Hub-Signature-256` and only processes PRs it already tracks.
+   Behind NAT, a `cloudflared`/`ngrok` tunnel to the port works fine.
+
+Devin's own GitHub connection is unaffected — sessions clone and open PRs
+through Devin's identity either way; this App only acts on the results.
+
+## 5. `.env`
 
 ```bash
 cp .env.example .env
@@ -90,8 +121,14 @@ cp .env.example .env
 | `DEVIN_CREDENTIALS_PATH` | no | CLI credentials (default `~/.local/share/devin/credentials.toml`) |
 | `DEVIN_API_URL_OVERRIDE` | no | Enterprise/staging API host |
 | `BRIDGE_TIMEOUT` | no | Seconds for bridge calls (default 60) |
+| `GITHUB_APP_ID` | GitHub | App ID — enables the whole GitHub surface when all three are set |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | GitHub | Path to the app `.pem` |
+| `GITHUB_APP_INSTALLATION_ID` | GitHub | From the install-page URL |
+| `GITHUB_MERGE_METHOD` | no | `squash` (default) / `merge` / `rebase` |
+| `GITHUB_WEBHOOK_SECRET` | no | Enables the `/github` webhook receiver |
+| `GITHUB_WEBHOOK_PORT` | no | Webhook listen port (default 8977) |
 
-## 5. Run
+## 6. Run
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e .[dev]

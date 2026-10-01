@@ -20,9 +20,14 @@ approval → anything you type in the thread steers the session.
   five `devin_mode` tiers
 - **Live relay** — Devin's messages stream into one thread per session
 - **Phone-friendly notifications** — @-mentions on turn end / real questions /
-  approval requests / failures; silent on routine suspensions
+  approval requests / failures / PR+CI transitions; silent on routine
+  suspensions
 - **Steering** — any message in a bound thread forwards to the session
   (auto-resumes suspended sessions); attachments pass through as URLs
+- **PR cards** — when a session opens a PR, the thread gets a card with
+  state + CI status and **Merge / Approve / Close** buttons (GitHub App)
+- **Issue/branch intake** — `/devin issue:#42 branch:feat-x` feeds GitHub
+  context into the prompt
 - **Buttons** — Open · Refresh · Approve · SSH instructions
 - **Durable** — SQLite bindings survive restarts; allowlist-gated
 

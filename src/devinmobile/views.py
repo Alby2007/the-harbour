@@ -4,9 +4,10 @@ from typing import Any, cast
 import discord
 
 PREFIX = "dvm"
-ACTIONS = ("ssh", "refresh", "approve")
+ACTIONS = ("ssh", "refresh", "approve",
+           "pr_merge", "pr_merge_go", "pr_approve", "pr_close")
 
-ComponentHandler = Callable[[discord.Interaction, str, str], Awaitable[None]]
+ComponentHandler = Callable[[discord.Interaction, str, str, str | None], Awaitable[None]]
 
 # discord.py fires BOTH a live View's callback and Client.on_interaction for
 # the same click on the same Interaction object. First entrant claims the
@@ -16,14 +17,15 @@ ComponentHandler = Callable[[discord.Interaction, str, str], Awaitable[None]]
 _INFLIGHT: set[int] = set()
 
 
-def make_custom_id(action: str, session_id: str) -> str:
-    return f"{PREFIX}:{action}:{session_id}"
+def make_custom_id(action: str, session_id: str, extra: str | None = None) -> str:
+    cid = f"{PREFIX}:{action}:{session_id}"
+    return f"{cid}:{extra}" if extra else cid
 
 
-def parse_custom_id(custom_id: str) -> tuple[str, str] | None:
-    parts = custom_id.split(":", 2)
-    if len(parts) == 3 and parts[0] == PREFIX and parts[1] in ACTIONS:
-        return parts[1], parts[2]
+def parse_custom_id(custom_id: str) -> tuple[str, str, str | None] | None:
+    parts = custom_id.split(":", 3)
+    if len(parts) >= 3 and parts[0] == PREFIX and parts[1] in ACTIONS:
+        return parts[1], parts[2], parts[3] if len(parts) == 4 else None
     return None
 
 
@@ -45,15 +47,62 @@ async def dispatch(
 
 class _CbButton(discord.ui.Button):
     def __init__(
-        self, *, label: str, custom_id: str, handler: ComponentHandler
+        self,
+        *,
+        label: str,
+        custom_id: str,
+        handler: ComponentHandler,
+        style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     ) -> None:
-        super().__init__(
-            style=discord.ButtonStyle.secondary, label=label, custom_id=custom_id
-        )
+        super().__init__(style=style, label=label, custom_id=custom_id)
         self._handler = handler
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await dispatch(interaction, self._handler)
+
+
+class PRView(discord.ui.View):
+    """Buttons on a PR card posted into a session thread.
+
+    `Merge` asks `handle_component` to open an ephemeral confirm (a second
+    click on the `pr_merge_go` button is the actual merge — keeps a fat-finger
+    tap from merging).
+    """
+
+    def __init__(
+        self, session_id: str, pr_number: int, pr_url: str, handler: ComponentHandler
+    ) -> None:
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link, label="Open on GitHub", url=pr_url,
+        ))
+        for action, label, style in (
+            ("pr_merge", "Merge", discord.ButtonStyle.success),
+            ("pr_approve", "Approve", discord.ButtonStyle.secondary),
+            ("pr_close", "Close PR", discord.ButtonStyle.danger),
+        ):
+            self.add_item(_CbButton(
+                label=label,
+                custom_id=make_custom_id(action, session_id, str(pr_number)),
+                handler=handler,
+                style=style,
+            ))
+
+
+class MergeConfirmView(discord.ui.View):
+    """Ephemeral confirm for PR merges."""
+
+    def __init__(
+        self, session_id: str, pr_number: int, handler: ComponentHandler
+    ) -> None:
+        super().__init__(timeout=60)
+        btn = _CbButton(
+            label="Confirm merge",
+            custom_id=make_custom_id("pr_merge_go", session_id, str(pr_number)),
+            handler=handler,
+        )
+        btn.style = discord.ButtonStyle.danger
+        self.add_item(btn)
 
 
 class SessionView(discord.ui.View):

@@ -48,11 +48,16 @@ suspended sessions stay steerable — a message reactivates them.
 
 ## Security
 
-- `DISCORD_TOKEN`, `DEVIN_API_KEY`, and `credentials.toml`'s
-  `windsurf_api_key` stay server-side; `.env` is gitignored.
+- `DISCORD_TOKEN`, `DEVIN_API_KEY`, `credentials.toml`'s
+  `windsurf_api_key`, and the GitHub App `.pem` stay server-side; `.env`
+  is gitignored. The App's installation token is minted in-memory and never
+  persisted.
 - `ALLOWED_USER_IDS` gates every command, every component click, and thread
   forwarding. An empty allowlist refuses to start — a Discord user with
-  access could otherwise spend ACUs.
+  access could otherwise spend ACUs (or merge a PR).
 - Keep the hub channel private: anyone who can *read* it sees session
   transcripts; anyone who can *write* to it can't steer (the allowlist still
   applies) but that's the threat model to keep in mind.
+- The webhook receiver only processes PRs already in the `prs` table and
+  rejects anything without a valid `X-Hub-Signature-256` — a forged POST
+  can't reach threads, and an unguessed PR can't be looked up.

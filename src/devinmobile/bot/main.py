@@ -9,8 +9,10 @@ from ..config import Settings
 from ..db import Database
 from ..devin_client import DevinClient
 from ..embeds import status_embed
+from ..github_client import GithubClient, PullRef
 from ..relay import Relay
-from ..views import dispatch
+from ..views import MergeConfirmView, dispatch
+from ..webhook_server import WebhookServer, maybe_start
 from .commands import register_commands
 
 log = logging.getLogger(__name__)
@@ -26,8 +28,10 @@ class DevinMobileBot(discord.Client):
         self.db: Database
         self.devin: DevinClient
         self.bridge: AcpBridge
+        self.github: GithubClient | None
         self.relay: Relay
         self._relay_task: asyncio.Task | None = None
+        self._webhook: WebhookServer | None = None
 
     async def setup_hook(self) -> None:
         self.db = await Database.connect(self.settings.db_path)
@@ -57,7 +61,23 @@ class DevinMobileBot(discord.Client):
                     log.warning("bridge catalog prefetch failed", exc_info=True)
 
             asyncio.create_task(_warm_catalog())
-        self.relay = Relay(self, self.devin, self.db, self.settings)
+        if self.settings.github_enabled:
+            self.github = GithubClient(
+                self.settings.github_app_id,
+                self.settings.github_app_private_key_path,
+                self.settings.github_app_installation_id,
+            )
+        elif any([
+            self.settings.github_app_id,
+            self.settings.github_app_private_key_path,
+            self.settings.github_app_installation_id,
+        ]):
+            log.warning("partial GITHUB_APP_* config — GitHub features disabled")
+        self.relay = Relay(
+            self, self.devin, self.db, self.settings, self.github,
+            component_handler=self.handle_component,
+        )
+        self._webhook = await maybe_start(self, self.db, self.settings)
         register_commands(self)
         if self.settings.command_guild_id:
             guild = discord.Object(id=self.settings.command_guild_id)
@@ -77,6 +97,10 @@ class DevinMobileBot(discord.Client):
             await self.db.close()
         if self.devin:
             await self.devin.aclose()
+        if self.github:
+            await self.github.aclose()
+        if self._webhook:
+            await self._webhook.stop()
         await super().close()
 
     # ---- steering: anything an allowed user types in a bound thread goes to
@@ -114,7 +138,11 @@ class DevinMobileBot(discord.Client):
         await dispatch(interaction, self.handle_component)
 
     async def handle_component(
-        self, interaction: discord.Interaction, action: str, session_id: str
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        session_id: str,
+        extra: str | None = None,
     ) -> None:
         if interaction.user.id not in self.settings.allowed_user_id_set:
             if not interaction.response.is_done():
@@ -123,6 +151,9 @@ class DevinMobileBot(discord.Client):
                 )
             return
         binding = await self.db.get_binding(session_id)
+        if action.startswith("pr_"):
+            await self._handle_pr_action(interaction, action, session_id, extra)
+            return
         if action == "ssh":
             await interaction.response.send_message(
                 f"```\nssh {session_id}@ssh.devin.ai\n```\n"
@@ -152,6 +183,59 @@ class DevinMobileBot(discord.Client):
                 message_as_user_id=self.settings.create_as_user_id,
             )
             await interaction.followup.send("Sent an approval to the session.", ephemeral=True)
+
+    async def _handle_pr_action(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        session_id: str,
+        pr_number: str | None,
+    ) -> None:
+        if self.github is None or not pr_number:
+            await interaction.response.send_message(
+                "GitHub App isn't configured (GITHUB_APP_*).", ephemeral=True
+            )
+            return
+        row = await self.db.get_pr_by_number(session_id, int(pr_number))
+        if row is None:
+            await interaction.response.send_message(
+                f"No PR #{pr_number} tracked for this session.", ephemeral=True
+            )
+            return
+        ref = PullRef(owner=row.owner, repo=row.repo, number=row.number)
+
+        if action == "pr_merge":
+            # first click just asks for confirmation — the real merge happens
+            # on pr_merge_go below
+            await interaction.response.send_message(
+                f"Merge **{row.pr_title or row.pr_url}** "
+                f"({self.settings.github_merge_method})?",
+                view=MergeConfirmView(session_id, row.number, self.handle_component),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if action == "pr_merge_go":
+                await self.github.merge_pr(ref, method=self.settings.github_merge_method)
+                row.state = "merged"
+                msg = f"Merged {ref.key}."
+            elif action == "pr_approve":
+                await self.github.approve_pr(ref)
+                msg = f"Approved {ref.key}."
+            elif action == "pr_close":
+                await self.github.close_pr(ref)
+                row.state = "closed"
+                msg = f"Closed {ref.key}."
+            else:
+                return
+            await self.db.upsert_pr(row)
+            if interaction.message:
+                await interaction.message.edit(view=None)  # drop stale buttons
+            await interaction.followup.send(msg, ephemeral=True)
+        except Exception as e:  # noqa: BLE001 — show GitHub's reason
+            await interaction.followup.send(f"`{e}`", ephemeral=True)
 
 
 def main() -> None:
