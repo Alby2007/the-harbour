@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     github_trigger_label: str = "devin"  # labeling an issue spawns a session
     github_review_label: str = "devin-review"  # labeling a PR spawns a review
 
+    # HTTP task intake — POST /task on the webhook port, bearer-authed.
+    # Empty = route off. Same trust model as the webhook secret.
+    task_intake_token: str = ""
+
     @cached_property
     def github_enabled(self) -> bool:
         return bool(

@@ -19,6 +19,7 @@ class _Settings:
     github_review_label = "devin-review"
     github_webhook_secret = "wh"
     github_webhook_port = 0
+    task_intake_token = ""
     silence_alert_minutes = 0
     create_as_user_id = None
     github_merge_method = "squash"

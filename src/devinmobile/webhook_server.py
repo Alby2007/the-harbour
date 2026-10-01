@@ -37,6 +37,7 @@ class WebhookServer:
         self.bot = bot
         self.db = db
         self.secret = settings.github_webhook_secret.encode()
+        self.task_token = settings.task_intake_token
         self.port = settings.github_webhook_port
         self._runner: web.AppRunner | None = None
 
@@ -48,12 +49,92 @@ class WebhookServer:
 
     async def start(self) -> None:
         app = web.Application()
-        app.router.add_post("/github", self._handle)
+        routes = []
+        if self.secret:
+            app.router.add_post("/github", self._handle)
+            routes.append("/github")
+        if self.task_token:
+            app.router.add_post("/task", self._handle_task)
+            routes.append("/task")
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "0.0.0.0", self.port)
         await site.start()
-        log.info("github webhook receiver on :%d/github", self.port)
+        log.info("webhook/intake receiver on :%d%s", self.port, routes)
+
+    async def _handle_task(self, request: web.Request) -> web.Response:
+        """POST /task — bearer-authed intake so anything that can curl
+        (Siri Shortcuts, Raycast, another bot) can spawn a session.
+        Discord becomes the renderer, not the only source."""
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        # bytes compare_digest — a non-ASCII bearer would TypeError on str
+        if not hmac.compare_digest(token.encode(), self.task_token.encode()):
+            return web.Response(status=401)
+        try:
+            payload = await request.json()
+        except ValueError:
+            return web.Response(status=400)
+        if not isinstance(payload, dict):
+            return web.Response(status=400)
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
+            return web.Response(status=400)
+        # present-but-wrong-type is a 400 — silently dropping a caller's
+        # repo/budget would spawn a different task than they asked for
+        raw_repo = payload.get("repo")
+        if raw_repo is None:
+            repos = None
+        elif isinstance(raw_repo, str):
+            repos = [r.strip() for r in raw_repo.split(",") if r.strip()]
+        elif isinstance(raw_repo, list) and all(
+            isinstance(r, str) for r in raw_repo
+        ):
+            repos = [r.strip() for r in raw_repo if r.strip()]
+        else:
+            return web.Response(status=400)
+        title = payload.get("title")
+        if title is not None and not isinstance(title, str):
+            return web.Response(status=400)
+        budget = payload.get("budget")
+        # bool is an int subclass — True would cap the task at 1 ACU
+        if budget is not None and (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or budget <= 0
+        ):
+            return web.Response(status=400)
+        from .spawn import SpawnError, spawn_session  # local: import cycle
+
+        try:
+            session, thread = await spawn_session(
+                self.bot,
+                prompt=prompt,
+                repos=repos or None,
+                title=title,
+                budget=float(budget) if budget is not None else None,
+            )
+        except SpawnError as e:
+            return web.json_response({"error": str(e)}, status=502)
+        except Exception:
+            log.exception("task intake spawn crashed")
+            return web.json_response({"error": "spawn crashed"}, status=500)
+        # best-effort provenance note — a send failure must NOT 500 the
+        # caller into a retry that double-spawns a paid session
+        try:
+            await thread.send("Spawned via `/task` intake.")
+        except Exception:
+            log.warning("intake note failed for %s", session.session_id)
+        guild_id = getattr(getattr(thread, "guild", None), "id", None)
+        return web.json_response({
+            "session_id": session.session_id,
+            "thread_id": str(thread.id),
+            "session_url": session.url,
+            # tappable deep-link into the live thread (Siri → Discord)
+            "thread_url": (
+                f"https://discord.com/channels/{guild_id or '@me'}/{thread.id}"
+            ),
+        })
 
     async def stop(self) -> None:
         if self._runner:
@@ -281,7 +362,8 @@ class WebhookServer:
 async def maybe_start(
     bot: DevinMobileBot, db: Database, settings: Settings
 ) -> WebhookServer | None:
-    if not settings.github_enabled or not settings.github_webhook_secret:
+    want_github = settings.github_enabled and settings.github_webhook_secret
+    if not (want_github or settings.task_intake_token):
         return None
     srv = WebhookServer(bot, db, settings)
     try:

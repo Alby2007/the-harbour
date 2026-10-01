@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     max_acu        REAL,
     review_of      TEXT,
     chain          TEXT,
+    summary        TEXT,
     created_at     INTEGER NOT NULL
 );
 
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     next_run_at      INTEGER NOT NULL,
     enabled          INTEGER NOT NULL DEFAULT 1,
     last_session_id  TEXT,
+    kind             TEXT NOT NULL DEFAULT 'spawn',  -- spawn | digest
     created_at       INTEGER NOT NULL
 );
 
@@ -108,10 +110,19 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         # playbook chain state (JSON) — travels on each phase's own row;
         # see chains.py for the shape
         "chain": "ALTER TABLE bindings ADD COLUMN chain TEXT",
+        # structured_output.summary captured at completion — feeds /digest
+        # and digest-kind schedules without N API calls
+        "summary": "ALTER TABLE bindings ADD COLUMN summary TEXT",
     },
     "prs": {
         "auto_merge": (
             "ALTER TABLE prs ADD COLUMN auto_merge INTEGER"
+        ),
+    },
+    "schedules": {
+        # 'spawn' (default) fires spawn_session; 'digest' posts a rollup
+        "kind": (
+            "ALTER TABLE schedules ADD COLUMN kind TEXT NOT NULL DEFAULT 'spawn'"
         ),
     },
 }
@@ -157,6 +168,7 @@ class ScheduleRow:
     next_run_at: int = 0
     enabled: bool = True
     last_session_id: str | None = None
+    kind: str = "spawn"  # 'spawn' fires a session; 'digest' posts a rollup
     created_at: int = 0
 
 
@@ -184,6 +196,7 @@ class Binding:
     max_acu: float | None = None  # per-task cap; None = follow global
     review_of: str = ""  # "owner/repo#n" when spawned by the review label
     chain: dict | None = None  # playbook state — see chains.py for shape
+    summary: str = ""  # structured_output.summary captured at completion
     created_at: int = 0
 
 
@@ -253,6 +266,7 @@ class Database:
                 _parse_chain(row["chain"])
                 if "chain" in row.keys() else None
             ),
+            summary=(row["summary"] or "") if "summary" in row.keys() else "",
             created_at=row["created_at"] or 0,
         )
 
@@ -264,8 +278,9 @@ class Database:
                (session_id, thread_id, channel_id, anchor_msg_id, title, url,
                 status, status_detail, msg_cursor, seen_event_ids, active, model,
                 last_msg, acus, acu_warned, last_activity_at, quiet_alerted,
-                repos, continued_from, max_acu, review_of, chain, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                repos, continued_from, max_acu, review_of, chain, summary,
+                created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
@@ -285,7 +300,11 @@ class Database:
                  review_of=COALESCE(NULLIF(excluded.review_of, ''),
                                     bindings.review_of),
                  chain=COALESCE(NULLIF(excluded.chain, ''),
-                                bindings.chain)""",
+                                bindings.chain),
+                 -- same convention: a state-only upsert must not wipe the
+                 -- completion-captured summary
+                 summary=COALESCE(NULLIF(excluded.summary, ''),
+                                  bindings.summary)""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
@@ -296,7 +315,8 @@ class Database:
                 b.last_activity_at or None, int(b.quiet_alerted),
                 b.repos or None, b.continued_from or None, b.max_acu,
                 b.review_of or None,
-                json.dumps(b.chain) if b.chain else None, b.created_at,
+                json.dumps(b.chain) if b.chain else None,
+                b.summary or None, b.created_at,
             ),
         )
         await self._conn.commit()
@@ -324,6 +344,19 @@ class Database:
     async def all_bindings(self, limit: int = 25) -> list[Binding]:
         async with self._conn.execute(
             "SELECT * FROM bindings ORDER BY created_at DESC LIMIT ?", (limit,)
+        ) as cur:
+            return [self._row_to_binding(r) for r in await cur.fetchall()]
+
+    async def bindings_since(self, since: int) -> list[Binding]:
+        """Digest window — a session counts if it was active in the window
+        (last_activity_at falls back to created_at) OR is still polling —
+        a long silent turn bumps no timestamps but belongs in the rollup."""
+        async with self._conn.execute(
+            """SELECT * FROM bindings
+               WHERE COALESCE(last_activity_at, created_at) >= ?
+                  OR active = 1
+               ORDER BY created_at""",
+            (since,),
         ) as cur:
             return [self._row_to_binding(r) for r in await cur.fetchall()]
 
@@ -486,7 +519,9 @@ class Database:
             repos=list(json.loads(row["repos"])), model=row["model"],
             interval_seconds=row["interval_seconds"],
             next_run_at=row["next_run_at"], enabled=bool(row["enabled"]),
-            last_session_id=row["last_session_id"], created_at=row["created_at"],
+            last_session_id=row["last_session_id"],
+            kind=row["kind"] or "spawn",
+            created_at=row["created_at"],
         )
 
     async def add_schedule(self, s: ScheduleRow) -> int:
@@ -496,10 +531,11 @@ class Database:
         cur = await self._conn.execute(
             """INSERT INTO schedules
                (prompt, repos, model, interval_seconds, next_run_at, enabled,
-                last_session_id, created_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                last_session_id, kind, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (s.prompt, json.dumps(s.repos), s.model, s.interval_seconds,
-             s.next_run_at, int(s.enabled), s.last_session_id, s.created_at),
+             s.next_run_at, int(s.enabled), s.last_session_id, s.kind,
+             s.created_at),
         )
         await self._conn.commit()
         return cur.lastrowid or 0

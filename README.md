@@ -50,6 +50,13 @@ approval → anything you type in the thread steers the session.
   every future spawn's prompt (`/notes`, `/unnote`); sessions can also
   write learnings back via `structured_output.repo_notes`, so each run
   teaches the next
+- **HTTP task intake** — `POST /task` (bearer-authed, `TASK_INTAKE_TOKEN`)
+  on the webhook port lets Siri Shortcuts, Raycast, or scripts spawn
+  sessions; the response's `thread_url` deep-links straight into the live
+  Discord thread
+- **Digest** — `/digest` and `/schedule kind:digest` roll up what Devin
+  did in a window (grouped by outcome, per-session summary + ACU) from
+  summaries persisted at completion — a local read, no API calls
 - **Resilience** — an errored session auto-respawns once as a seeded
   continuation (summary + files + error), and `/continue` chains a
   finished session's work into a fresh one

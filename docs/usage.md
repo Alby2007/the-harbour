@@ -50,10 +50,22 @@ Recurring sessions — the task queue that runs while you sleep.
 | `recipe` | optional, choice | Canned maintenance loop: `dep-audit` (outdated + vulnerable deps → upgrade PR), `test-coverage` (coverage gaps → test PR), `security-scan` (scanners + secrets/auth audit → severity report). A `prompt:` given alongside is appended to the recipe |
 | `repo` | optional, autocomplete | Repo(s) for each run |
 | `model` | optional | Model alias (bridge) |
+| `kind` | optional, choice | `spawn` (default) runs the prompt; `digest` posts a rollup of what Devin did in the window to the hub channel instead — `/schedule kind:digest every:1d` is the nightly standup |
 
 Rows persist in SQLite and survive restarts. A downtime doesn't
 catch-fire the backlog — `next_run_at` slides forward from the actual fire
 time.
+
+### `/digest`
+
+`/digest hours:N` (default 24, max 168) — an ephemeral embed grouping the
+window's sessions into Completed / Errored / Suspended / In flight, each
+row linked to its thread with the captured `structured_output` summary
+and ACU spend; footer totals the window. Summaries persist on the binding
+at completion, so no API calls — sessions that finished before this
+feature landed show title-only. A session counts if it had activity in
+the window or is still polling — a long silent run doesn't fall out.
+A session active across two windows appears in both.
 
 ### `/continue`
 
@@ -173,6 +185,30 @@ group by session *start* (ACU is cumulative per session, not per day).
 ### `/devin-status [session_id]`
 
 Refreshes a session's status embed on demand (defaults to the most recent).
+
+## HTTP task intake
+
+`POST /task` on the webhook port lets anything that can curl spawn a
+session — Siri Shortcuts, Raycast, another bot, a cron script. Discord
+becomes the renderer rather than the only intake source.
+
+Set `TASK_INTAKE_TOKEN` to enable (empty = route off). The port is the
+same `GITHUB_WEBHOOK_PORT`; the bearer token is the whole auth story, so
+keep it behind the same tunnel/firewall as the webhook secret.
+
+```bash
+curl -X POST https://<host>/task \
+  -H "Authorization: Bearer $TASK_INTAKE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "fix the flaky login test", "repo": "org/repo", "budget": 5}'
+```
+
+Body: `prompt` (required, ≤4000 chars), `repo` (string or array,
+comma-separate works), `title`, `budget` (ACU cap). Success → `200` with
+`session_id`, `thread_id`, `session_url`, and `thread_url` — the Discord
+deep-link is what makes a Shortcut useful (tap → lands in the live
+thread). Errors: `401` bad/missing token, `400` bad body, `502` spawn
+failure.
 
 ## The thread
 

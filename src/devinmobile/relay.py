@@ -671,6 +671,11 @@ class Relay:
                 file=diff_file if diff_file is not None else discord.utils.MISSING,
                 view=done_view,
             )
+            # Persist the summary for /digest — the tick-end upsert_binding
+            # carries it to the db, so a digest stays one local read.
+            summary = (session.structured_output or {}).get("summary")
+            if isinstance(summary, str) and summary.strip():
+                binding.summary = summary.strip()[:2000]
             await self._harvest_repo_notes(binding, session)
         else:
             await thread.send(text)

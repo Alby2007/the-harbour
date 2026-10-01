@@ -10,6 +10,7 @@ from discord import app_commands
 from ..acp_bridge import MODEL_ALIASES
 from ..chains import PLAYBOOKS, continued_chain, render_prompt
 from ..db import Binding, ScheduleRow
+from ..digest import build_digest
 from ..embeds import status_embed
 from ..github_client import parse_issue_ref
 from ..spawn import SpawnError, spawn_session
@@ -419,9 +420,14 @@ def register_commands(bot: "DevinMobileBot") -> None:
         recipe="Canned task — dep-audit, test-coverage, security-scan",
         repo="org/repo (comma-separate for several)",
         model="Model picker (optional)",
+        kind="spawn = run the prompt; digest = post the window rollup",
     )
     @app_commands.choices(
-        recipe=[app_commands.Choice(name=k, value=k) for k in RECIPES]
+        recipe=[app_commands.Choice(name=k, value=k) for k in RECIPES],
+        kind=[
+            app_commands.Choice(name="spawn", value="spawn"),
+            app_commands.Choice(name="digest", value="digest"),
+        ],
     )
     @app_commands.autocomplete(model=model_autocomplete, repo=repo_autocomplete)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -432,11 +438,18 @@ def register_commands(bot: "DevinMobileBot") -> None:
         recipe: str | None = None,
         repo: str | None = None,
         model: str | None = None,
+        kind: str | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
-        if recipe:
+        kind = kind or "spawn"
+        if kind == "digest":
+            # prompt is just a label — the rollup covers ALL activity in
+            # the window, so spawn params would be silently ignored
+            prompt = prompt or "digest"
+            repo = model = recipe = None
+        elif recipe:
             prompt = f"{RECIPES[recipe]}\n\n{prompt}" if prompt else RECIPES[recipe]
         if not prompt:
             await interaction.response.send_message(
@@ -456,11 +469,17 @@ def register_commands(bot: "DevinMobileBot") -> None:
             model=model,
             interval_seconds=interval,
             next_run_at=int(time.time()) + interval,
+            kind=kind,
         )
         row.id = await bot.db.add_schedule(row)
+        detail = (
+            "posts the activity rollup to the hub channel"
+            if kind == "digest"
+            else f"`{prompt[:80]}` on {', '.join(row.repos) or 'default repos'}"
+        )
         await interaction.response.send_message(
             f"Scheduled #{row.id} — every {every}, first run in {every}.\n"
-            f"`{prompt[:80]}` on {', '.join(row.repos) or 'default repos'}",
+            f"{detail}",
             ephemeral=True,
         )
 
@@ -547,8 +566,9 @@ def register_commands(bot: "DevinMobileBot") -> None:
         for s in rows:
             state = "on" if s.enabled else "off"
             due = "due now" if s.next_run_at <= now else f"next <t:{s.next_run_at}:R>"
+            tag = " · digest" if s.kind == "digest" else ""
             embed.add_field(
-                name=f"#{s.id} · every {s.interval_seconds // 60}m · {state}",
+                name=f"#{s.id} · every {s.interval_seconds // 60}m · {state}{tag}",
                 value=(
                     f"`{s.prompt[:80]}`\n{', '.join(s.repos) or 'default repos'} · {due}"
                 ),
@@ -571,6 +591,23 @@ def register_commands(bot: "DevinMobileBot") -> None:
             await interaction.response.send_message(
                 f"No schedule #{schedule_id}.", ephemeral=True
             )
+
+    @tree.command(
+        name="digest",
+        description="Rollup of what Devin did — sessions grouped by outcome",
+    )
+    @app_commands.describe(hours="Lookback window (default 24h, max 168h)")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def digest_cmd(
+        interaction: discord.Interaction, hours: int = 24
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        hours = max(1, min(hours, 168))
+        since = int(time.time()) - hours * 3600
+        embed = build_digest(await bot.db.bindings_since(since), since)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @tree.command(
         name="note",

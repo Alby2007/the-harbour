@@ -150,7 +150,18 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   be flipped after CI is already green — and its own notice consumes the
   merged transition to avoid a double ping.
 - `schedules.next_run_at` slides from fire-time, not due-time — catch-up
-  storms after downtime are worse than missed runs.
+  storms after downtime are worse than missed runs. `schedules.kind` =
+  `'spawn'` (default) or `'digest'` — digest rows post `build_digest`
+  (digest.py) to the hub channel instead of spawning; `bindings.summary`
+  is captured from `structured_output.summary` in `_notify`'s complete
+  branch so digests stay a local read (`bindings_since` window via
+  `COALESCE(last_activity_at, created_at)`).
+- `webhook_server.py` routes register per credential: `/github` when the
+  HMAC secret is set, `/task` when `TASK_INTAKE_TOKEN` is set; the server
+  starts if either exists. `/task` is bearer auth (`hmac.compare_digest`)
+  → `spawn_session` → returns `thread_url` (the Discord deep-link that
+  makes Siri/Raycast intake useful). Same trust model as the webhook
+  secret — no extra hardening beyond it.
 - Webhook `_post` takes `view=`; fake test channels must accept `**kw`.
 - Voice steering: `message.attachments` with `audio/*` (or `.waveform`)
   transcribe via Whisper when `OPENAI_API_KEY` is set; the transcript

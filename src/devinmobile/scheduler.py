@@ -12,6 +12,9 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+import discord
+
+from .digest import build_digest
 from .spawn import SpawnError, spawn_session
 
 if TYPE_CHECKING:
@@ -50,6 +53,9 @@ class Scheduler:
     async def _fire_due(self) -> None:
         now = int(time.time())
         for s in await self.bot.db.due_schedules(now):
+            if s.kind == "digest":
+                await self._fire_digest(s, now)
+                continue
             try:
                 session, thread = await spawn_session(
                     self.bot,
@@ -68,3 +74,23 @@ class Scheduler:
                 await self.bot.db.schedule_ran(s.id, "", now)
             except Exception:
                 log.exception("schedule #%d spawn crashed", s.id)
+
+    async def _fire_digest(self, s, now: int) -> None:
+        """digest-kind row → post the window rollup to the hub channel
+        instead of spawning. Same slide-forward semantics as spawn —
+        including on failure, so a dead hub channel can't retry-storm
+        every tick."""
+        try:
+            since = now - s.interval_seconds
+            bindings = await self.bot.db.bindings_since(since)
+            hub_id = self.bot.settings.hub_channel_id
+            chan = (
+                self.bot.get_channel(hub_id)
+                or await self.bot.fetch_channel(hub_id)
+            ) if hub_id is not None else None
+            if isinstance(chan, discord.abc.Messageable):
+                await chan.send(embed=build_digest(bindings, since))
+        except Exception:
+            log.exception("schedule #%d digest crashed", s.id)
+        finally:
+            await self.bot.db.schedule_ran(s.id, "", now)
