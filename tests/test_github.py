@@ -146,6 +146,43 @@ async def test_client_error_surfaces_message():
     await gh.aclose()
 
 
+async def test_failed_checks_and_review_feedback():
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/check-runs"):
+            return httpx.Response(200, json={"check_runs": [
+                {"name": "pytest", "conclusion": "failure", "html_url": "u1"},
+                {"name": "lint", "conclusion": "success", "html_url": "u2"},
+                {"name": "deploy", "conclusion": "timed_out", "html_url": "u3"},
+            ]})
+        if path.endswith("/comments"):
+            return httpx.Response(200, json=[{
+                "body": "nit: rename this", "path": "a.py",
+                "user": {"login": "rev1"}, "created_at": "2026-01-01",
+            }])
+        if path.endswith("/reviews"):
+            return httpx.Response(200, json=[{
+                "body": "needs a test", "state": "CHANGES_REQUESTED",
+                "user": {"login": "rev2"}, "submitted_at": "2026-01-02",
+            }])
+        if path.endswith("/files"):
+            return httpx.Response(200, json=[
+                {"filename": "a.py", "additions": 10, "deletions": 2},
+                {"filename": "b.py", "additions": 5, "deletions": 0},
+            ])
+        return httpx.Response(200, json={"head": {"sha": "abc"}})
+
+    gh = _gh_client(handler)
+    ref = PullRef("o", "r", 5)
+    fails = await gh.get_failed_checks(ref)
+    assert [f["name"] for f in fails] == ["pytest", "deploy"]
+    fb = await gh.get_review_feedback(ref)
+    assert fb[0]["kind"] == "comment" and fb[1]["state"] == "CHANGES_REQUESTED"
+    files = await gh.get_pr_files(ref)
+    assert sum(f["additions"] for f in files) == 15
+    await gh.aclose()
+
+
 # ---- prs table ----------------------------------------------------------------
 
 
@@ -196,12 +233,15 @@ async def test_pr_roundtrip_and_join(tmp_path):
 class _FakeThread(discord.abc.Messageable):
     def __init__(self) -> None:
         self.sent: list[str] = []
+        self.views: list = []
 
     async def _get_channel(self):
         return self
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str, **kw) -> None:
         self.sent.append(text)
+        if kw.get("view") and kw["view"] is not discord.utils.MISSING:
+            self.views.append(kw["view"])
 
 
 class _FakeBot:
@@ -211,6 +251,9 @@ class _FakeBot:
 
     def get_channel(self, _id):
         return self._thread
+
+    async def handle_component(self, *a, **kw):
+        pass
 
 
 def _server(bot, db) -> WebhookServer:
@@ -251,6 +294,73 @@ async def test_webhook_pull_request_event(tmp_path):
         "pull_request": {"number": 999, "state": "open"},
     })
     assert await db.get_pr_by_ref("s1", "o", "r", 999) is None
+    await db.close()
+
+
+async def test_webhook_review_event_posts_button(tmp_path):
+    db = await Database.connect(str(tmp_path / "t.db"))
+    await db.upsert_binding(Binding(session_id="s1", thread_id=10, channel_id=1))
+    await db.upsert_pr(PrRow(
+        session_id="s1", pr_url="https://github.com/o/r/pull/5",
+        owner="o", repo="r", number=5, state="open",
+    ))
+    thread = _FakeThread()
+    srv = _server(_FakeBot(thread), db)
+    await srv._on_review({
+        "repository": {"name": "r", "owner": {"login": "o"}},
+        "pull_request": {"number": 5},
+        "review": {"body": "please add a test", "user": {"login": "rev"}},
+    })
+    assert any("please add a test" in m for m in thread.sent)
+    assert len(thread.views) == 1  # the Send-to-Devin button rode along
+
+    # empty review body and bot-authored reviews are skipped
+    await srv._on_review({
+        "repository": {"name": "r", "owner": {"login": "o"}},
+        "pull_request": {"number": 5},
+        "review": {"body": "", "user": {"login": "rev"}},
+    })
+    await srv._on_review({
+        "repository": {"name": "r", "owner": {"login": "o"}},
+        "pull_request": {"number": 5},
+        "review": {"body": "lgtm", "user": {"login": "devin-bot[bot]"}},
+    })
+    assert len(thread.sent) == 1
+    await db.close()
+
+
+async def test_webhook_issue_label_spawns_session(tmp_path, monkeypatch):
+    import devinmobile.spawn as spawn_mod
+
+    spawned = []
+
+    async def fake_spawn(bot, *, prompt, repos=None, model=None, mode=None,
+                         title=None):
+        spawned.append({"prompt": prompt, "repos": repos, "title": title})
+        return SimpleNamespace(session_id="s9"), _FakeThread()
+
+    monkeypatch.setattr(spawn_mod, "spawn_session", fake_spawn)
+    db = await Database.connect(str(tmp_path / "t.db"))
+    bot = _FakeBot(_FakeThread())
+    srv = _server(bot, db)
+    await srv._on_issue({
+        "action": "labeled",
+        "label": {"name": "devin"},
+        "issue": {"number": 7, "title": "Fix crash",
+                  "body": "it dies", "html_url": "u"},
+        "repository": {"name": "Stockbot", "owner": {"login": "Alby2007"}},
+    })
+    assert spawned and spawned[0]["repos"] == ["Alby2007/Stockbot"]
+    assert "Fix crash" in spawned[0]["prompt"]
+
+    # wrong label / unlabel events do nothing
+    await srv._on_issue({
+        "action": "labeled", "label": {"name": "bug"},
+        "issue": {"number": 8}, "repository": {},
+    })
+    await srv._on_issue({"action": "unlabeled", "label": {"name": "devin"},
+                         "issue": {"number": 7}, "repository": {}})
+    assert len(spawned) == 1
     await db.close()
 
 
@@ -395,6 +505,40 @@ async def test_poll_pr_ci_failure_mentions(tmp_path):
     await relay._sync_prs(binding, _session_with_pr(url))
     texts = [str(a[0]) for a, _ in thread.sent if a]
     assert any("<@111>" in t and "CI failing" in t for t in texts)
+    await db.close()
+
+
+async def test_auto_merge_fires_on_green(tmp_path):
+    db = await Database.connect(str(tmp_path / "t.db"))
+    binding = Binding(session_id="s1", thread_id=10, channel_id=1)
+    await db.upsert_binding(binding)
+    url = "https://github.com/o/r/pull/5"
+    thread = _RelayThread()
+
+    class _MergeGh(_FakeGithub):
+        def __init__(self) -> None:
+            super().__init__({"title": "t", "state": "open", "merged": False},
+                             checks="success")
+            self.merged = False
+
+        async def merge_pr(self, ref, method="squash"):
+            self.merged = True
+            return {}
+
+    gh = _MergeGh()
+    relay = await _relay(db, thread, gh)
+    await relay._sync_prs(binding, _session_with_pr(url))
+    assert not gh.merged  # flag off → green CI alone doesn't merge
+
+    row = await db.get_pr("s1", url)
+    row.auto_merge = True
+    await db.upsert_pr(row)
+    await relay._sync_prs(binding, _session_with_pr(url))
+    assert gh.merged
+    texts = [str(a[0]) for a, _ in thread.sent if a]
+    assert any("auto-merged" in t for t in texts)
+    # the auto-merge notice consumed the transition — no second "merged" post
+    assert sum("merged" in t for t in texts) == 1
     await db.close()
 
 

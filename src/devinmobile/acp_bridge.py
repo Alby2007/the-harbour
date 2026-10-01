@@ -24,11 +24,14 @@ import itertools
 import json
 import logging
 import tomllib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import aiohttp
+
+UpdateCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 log = logging.getLogger(__name__)
 
@@ -420,3 +423,155 @@ class AcpBridge:
             )
         finally:
             await self._close(ws)
+
+
+class SessionStream:
+    """One persistent bridge WebSocket that ``session/load``s bound sessions
+    and fans their ``session/update`` notifications out to a callback.
+
+    Unlike ``AcpBridge._rpc`` (open → request → close, one request at a
+    time), this keeps a reader task demultiplexing responses into pending
+    futures so notifications flow continuously — verified live: a loaded
+    socket streams tool_call/agent_*_chunk updates for a session steered
+    out-of-band via the v3 API.
+    """
+
+    def __init__(self, bridge: AcpBridge, on_update: UpdateCallback) -> None:
+        self._bridge = bridge
+        self._on_update = on_update
+        self._ids = itertools.count(10_000_000)  # far from _rpc's range
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._owned: aiohttp.ClientSession | None = None
+        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._reader: asyncio.Task | None = None
+        self._attach_lock = asyncio.Lock()
+        self._attached: set[str] = set()  # bare session ids already loaded
+
+    async def attach(self, session_id: str) -> None:
+        """Load a session onto the stream socket (idempotent)."""
+        if session_id in self._attached:
+            return
+        async with self._attach_lock:
+            if session_id in self._attached:
+                return
+            if self._ws is None or self._ws.closed:
+                await self._open()
+            devin_id = (
+                session_id if session_id.startswith("devin-")
+                else f"devin-{session_id}"
+            )
+            try:
+                await self._rpc(
+                    "session/load",
+                    {"sessionId": devin_id, "cwd": "/", "mcpServers": []},
+                )
+            except BridgeError as e:
+                log.warning("session/load failed for %s: %s", session_id, e)
+                return
+            self._attached.add(session_id)
+
+    async def aclose(self) -> None:
+        if self._reader:
+            self._reader.cancel()
+            self._reader = None
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+        owned, self._owned = self._owned, None
+        if owned is not None:
+            await owned.close()
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.cancel()
+        self._pending.clear()
+        self._attached.clear()
+
+    async def _open(self) -> None:
+        token, api_url = self._bridge._load_credentials()
+        ws_url = api_url.replace("https://", "wss://").replace("http://", "ws://")
+        ws_url = f"{ws_url}/acp/live?token={token}"
+        owned = aiohttp.ClientSession()
+        try:
+            ws = await owned.ws_connect(ws_url)
+        except BaseException:
+            await owned.close()
+            raise BridgeError("stream connect failed") from None
+        self._ws, self._owned = ws, owned
+        self._reader = asyncio.create_task(self._reader_loop())
+        await self._rpc(
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": False, "writeTextFile": False},
+                    "terminal": False,
+                },
+                "clientInfo": {"name": "devinmobile-stream", "version": "0.1.0"},
+            },
+        )
+
+    async def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if self._ws is None or self._ws.closed:
+            raise BridgeError(f"stream not open for {method}")
+        rid = next(self._ids)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending[rid] = fut
+        try:
+            await self._ws.send_str(
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+                )
+            )
+            return await asyncio.wait_for(fut, self._bridge._timeout)
+        except TimeoutError:
+            raise BridgeError(f"{method} timed out") from None
+        finally:
+            self._pending.pop(rid, None)
+
+    async def _reader_loop(self) -> None:
+        ws = self._ws
+        try:
+            async for msg in ws:  # type: ignore[union-attr]
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    data = json.loads(msg.data)
+                except ValueError:
+                    continue
+                rid = data.get("id")
+                if rid is not None and rid in self._pending:
+                    fut = self._pending.pop(rid)
+                    if not fut.done():
+                        if "error" in data:
+                            err = data["error"]
+                            fut.set_exception(
+                                BridgeError(err.get("message", str(err)))
+                            )
+                        else:
+                            fut.set_result(data.get("result") or {})
+                    continue
+                if data.get("method") == "session/update":
+                    params = data.get("params") or {}
+                    sid = str(params.get("sessionId") or "").removeprefix("devin-")
+                    if sid:
+                        try:
+                            await self._on_update(sid, params.get("update") or {})
+                        except Exception:
+                            log.exception("session/update handler failed")
+        except (aiohttp.ClientError, OSError, asyncio.CancelledError):
+            pass
+        except Exception:
+            log.exception("stream reader crashed")
+        finally:
+            # Socket died — clear everything so the next attach() re-opens it
+            # and re-loads each session. Pending calls fail loudly.
+            self._ws = None
+            self._attached.clear()
+            for rid, fut in list(self._pending.items()):
+                if not fut.done():
+                    fut.set_exception(BridgeError("stream connection lost"))
+                self._pending.pop(rid, None)

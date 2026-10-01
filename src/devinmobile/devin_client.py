@@ -127,6 +127,14 @@ class DevinClient:
         )
         return Session.model_validate(resp.json())
 
+    async def terminate_session(self, session_id: str) -> None:
+        """DELETE the session — stops ACU burn on /kill. If the API doesn't
+        support it (unverified), the caller's park+archive is the fallback."""
+        resp = await self._request(
+            "DELETE", self._path(f"/sessions/{session_id}")
+        )
+        resp.raise_for_status()
+
     async def list_messages(
         self, session_id: str, *, after: str | None = None, first: int = 200
     ) -> MessagePage:

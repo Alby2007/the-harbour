@@ -16,15 +16,21 @@ Discord (phone)                    bot host                      Devin
              v
       thread + anchor embed + sqlite binding
              │
-             └──────────────  relay loop (15s) ──────────────────────> v3 GET
+             └──────────────  relay loop (5s) ───────────────────────> v3 GET
                           messages cursor + status diff +                    |
                           pull_requests                                      v
              │            PR card -> thread; buttons ────────> GitHub API
-             │            (merge/approve/close, CI rollup)    (App install
-             │                                               token via JWT)
+             │            (merge/approve/close/automerge,     (App install
+             │             CI rollup, Fix-CI, review loop)     token via JWT)
              └──────────────  thread msg -> v3 POST /messages ───────> steer
 
+SessionStream: one persistent bridge WS ── session/load per binding ──>
+  session/update notifications ──> "Working…" message edited in place
+
 GitHub webhooks (optional) ──> aiohttp :PORT/github ──> prs lookup ──> thread
+                          └─> issues:labeled(devin) ──> spawn_session
+
+schedules table ──> Scheduler task (60s) ──> spawn_session ──> new thread
 ```
 
 Two APIs, one session:
@@ -33,10 +39,13 @@ Two APIs, one session:
   status + messages, send follow-ups, PR links, structured output. Public and
   documented.
 - **ACP bridge** (`wss://api.devin.ai/acp/live?token=`, the CLI's user
-  credential) — used ONLY to *create* a session when `model:` is requested,
-  because v3 has no model field. The moment the bridge session's first
-  prompt lands it materializes into the org session store and everything —
-  status, messages, steering — proceeds over v3 like any other session.
+  credential) — creates sessions when `model:` is requested (v3 has no
+  model field), and also hosts the optional **SessionStream**: one
+  persistent socket that `session/load`s each active session and relays
+  its `session/update` tool-call notifications into the thread's live
+  progress message. The moment a bridge session's first prompt lands it
+  materializes into the org session store — everything else proceeds over
+  v3 like any other session.
   Service-key perms (`ViewOrgSessions`/`ManageOrgSessions`) cover it.
 
 Why not the bridge for everything? v3 gives us `tags`, `title`,
@@ -58,13 +67,18 @@ state and perform merge/approve/close on the org's repos.
 | `devin_client.py` | async v3 client — retry/backoff on 429+5xx, typed `Session`/`MessagePage` |
 | `acp_bridge.py` | WS JSON-RPC client: credentials.toml → `session/new` → `set_config_option` → `session/prompt`; fuzzy model resolution against live `configOptions` |
 | `db.py` | `bindings` table: `session_id ↔ thread_id ↔ anchor_msg_id`, `msg_cursor`, `seen_event_ids` (dedupe), `active` flag, `model` label. `prs` table: one row per (session, PR) — card msg id, last notified state, CI rollup |
-| `relay.py` | one poll loop: drain new `source=="devin"` messages into the thread, then diff `status`/`status_detail` → notifications; syncs `session.pull_requests` → PR cards and polls state/CI for transitions; one-shot `channel.typing()` while mid-turn is the liveness signal. `request_poll` fires an immediate out-of-band poll after user sends/creates (per-binding lock guards against the loop racing it). `active=0` parks dead sessions; a message reactivates |
-| `github_client.py` | GitHub App client: PEM → RS256 JWT → installation token (cached ~55min); `get_pr`, `check-runs` rollup, `merge`, `approve`, `close`, `get_issue`. URL/issue-ref parsers and the checks-state reducer live here too |
-| `webhook_server.py` | optional aiohttp receiver (`POST /github`, HMAC-SHA256 verified) — `pull_request`/`check_run`/`check_suite` events routed to the owning thread via the `prs` table. Polling covers the same transitions; this only lowers latency |
-| `embeds.py` | status + completion embeds (structured_output → summary/files/tests) + `pr_embed` cards |
-| `views.py` | stateless buttons (`dvm:{action}:{session_id}[:{extra}]` custom_ids survive restarts; `_INFLIGHT` dedupes the double-dispatch with `on_interaction`). `PRView` carries the PR number in `extra`; merges get a `MergeConfirmView` ephemeral step |
-| `bot/commands.py` | `/devin` `/sessions` `/devin-status`, model autocomplete, `_wait_for_v3` materialization poll |
-| `bot/main.py` | client wiring, allowlist gate, thread→session steering (`on_message`), component dispatch |
+| `relay.py` | one poll loop: drain new `source=="devin"` messages into the thread, then diff `status`/`status_detail` → notifications; syncs `session.pull_requests` → PR cards and polls state/CI for transitions (opt-in `auto_merge` fires on green); one-shot `channel.typing()` while mid-turn; ACU-cap alerts at 80%/100%; quiet-streak watchdog. `request_poll` coalesces immediate re-polls (per-binding lock guards against the loop racing it). `active` derives from live status each poll — a message reactivates parked sessions |
+| `acp_bridge.py` `SessionStream` | one persistent bridge WS: `session/load`s each active session, demuxes responses into pending futures while `session/update` notifications stream to `relay.on_progress` |
+| `progress.py` | `ProgressTracker` — renders tool-call titles into ONE per-turn message edited in place (~3s throttle, last 6 lines), deleted on turn end |
+| `spawn.py` | `spawn_session()` — the shared create path (repo canonicalization, bridge/v3 routing, thread+anchor+binding, first poll). `/devin`, `/devin-all`, `/schedule`, and the label trigger all ride it |
+| `scheduler.py` | 60s tick over the `schedules` table → `spawn_session` per due row; `next_run_at` slides from fire-time so downtime can't storm |
+| `transcribe.py` | Whisper via httpx multipart — Discord voice attachments → text for `on_message` steering. Off unless `OPENAI_API_KEY` is set |
+| `github_client.py` | GitHub App client: PEM → RS256 JWT → installation token (cached ~55min); `get_pr`, `check-runs` rollup + `get_failed_checks`, `merge`, `approve`, `close`, `get_issue`, `get_pr_files`, `get_review_feedback`. URL/issue-ref parsers and the checks-state reducer live here too |
+| `webhook_server.py` | optional aiohttp receiver (`POST /github`, HMAC-SHA256 verified) — `pull_request`/`check_run`/`check_suite` events routed to the owning thread via the `prs` table; `pull_request_review*` posts comments with a Send-to-Devin button; `issues:labeled(GITHUB_TRIGGER_LABEL)` spawns a session. Polling covers state transitions; review/label paths are webhook-only |
+| `embeds.py` | status + completion embeds (structured_output → summary/files/tests + GitHub diffstat) + `pr_embed` cards |
+| `views.py` | stateless buttons (`dvm:{action}:{session_id}[:{extra}]` custom_ids survive restarts; `_INFLIGHT` dedupes the double-dispatch with `on_interaction`). `PRView` carries `owner/repo#n` in `extra`; merges get a `MergeConfirmView` ephemeral step; `FixCIView`/`ReviewNotifyView` are the one-button steering views |
+| `bot/commands.py` | `/devin` `/devin-all` `/schedule` `/schedules` `/unschedule` `/sessions` `/kill` `/devin-status`, model+repo autocomplete |
+| `bot/main.py` | client wiring, allowlist gate, thread→session steering (`on_message` incl. voice-note transcription), component dispatch |
 
 ## State model
 
@@ -85,5 +99,7 @@ history and dedupes locally. Fine at this scale.
 - Bridge: `BridgeError` on bad creds (403 → "re-run `devin auth login`"),
   RPC errors, timeouts (`BRIDGE_TIMEOUT`). `session/prompt` doesn't block on
   the turn — `_rpc` returns on the first `session/update` for the session.
+- Stream: reader death clears `_ws`/`_attached` and fails pending futures;
+  the next poll's `attach()` re-opens and re-loads every bound session.
 - A failed create never leaves a registered binding.
 - Per-binding poll exceptions are logged and isolated.

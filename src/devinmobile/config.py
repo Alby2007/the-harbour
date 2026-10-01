@@ -24,11 +24,17 @@ class Settings(BaseSettings):
 
     db_path: str = "devinmobile.db"
     poll_interval_seconds: float = 5.0
+    # quiet-streak (min) before the relay posts a "still working?" note; 0=off
+    silence_alert_minutes: float = 20.0
+    # voice-note steering: audio attachments in bound threads get transcribed
+    openai_api_key: str = ""
 
     # ACP bridge (model-selected cloud sessions). Written by `devin auth login`.
     devin_credentials_path: str = "~/.local/share/devin/credentials.toml"
     devin_api_url_override: str | None = None  # e.g. for staging/enterprise hosts
     bridge_timeout: float = 60.0
+    # stream session/update progress into threads via a persistent bridge WS
+    acp_progress: bool = True
 
     # GitHub App — powers PR cards/actions, CI status, issue intake, webhooks.
     github_app_id: str = ""
@@ -37,6 +43,7 @@ class Settings(BaseSettings):
     github_webhook_secret: str = ""  # empty = webhook receiver off
     github_webhook_port: int = 8977
     github_merge_method: str = "squash"  # merge | squash | rebase
+    github_trigger_label: str = "devin"  # labeling an issue spawns a session
 
     @cached_property
     def github_enabled(self) -> bool:

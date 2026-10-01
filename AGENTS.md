@@ -115,3 +115,25 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   autocomplete.
   The bridge token is user-scoped OAuth — sessions made through it belong to
   that user and are NOT visible to the service key until first prompt.
+- `SessionStream` (acp_bridge.py): one persistent bridge WS; `session/load`
+  accepts `devin-{id}` for ANY org session (v3-created too — verified live)
+  and `session/update` notifications stream tool_call titles while the
+  session is steered out-of-band. `_rpc`'s read loop can't multiplex, so the
+  stream has its own reader task + pending-future map. Socket death clears
+  `_attached` — the next poll's `attach()` re-opens and re-loads.
+  `progress.py` renders them into ONE edited "Working…" message per turn
+  (deleted on turn end — don't post one message per tool call, it spams).
+- `spawn.py::spawn_session` is THE create path — `/devin`, `/devin-all`,
+  `/schedule` rows, and the `issues:labeled` webhook all call it. Anything
+  spawn-wide (canonicalization, precedence, binding fields) belongs there.
+- `prs.auto_merge` is `INTEGER NULL`: None means "upsert doesn't carry the
+  flag" so a state-only poll can't clobber an explicit toggle. Auto-merge
+  checks run EVERY poll (not in the transition dedupe) because the flag can
+  be flipped after CI is already green — and its own notice consumes the
+  merged transition to avoid a double ping.
+- `schedules.next_run_at` slides from fire-time, not due-time — catch-up
+  storms after downtime are worse than missed runs.
+- Webhook `_post` takes `view=`; fake test channels must accept `**kw`.
+- Voice steering: `message.attachments` with `audio/*` (or `.waveform`)
+  transcribe via Whisper when `OPENAI_API_KEY` is set; the transcript
+  echoes as a quote so the user sees what Devin got.

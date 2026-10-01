@@ -74,6 +74,10 @@ class WebhookServer:
                 await self._on_pull_request(payload)
             elif event in ("check_run", "check_suite"):
                 await self._on_check(payload)
+            elif event == "issues":
+                await self._on_issue(payload)
+            elif event in ("pull_request_review", "pull_request_review_comment"):
+                await self._on_review(payload)
         except Exception:
             log.exception("webhook %s handling failed", event)
         return web.Response(status=204)
@@ -122,6 +126,76 @@ class WebhookServer:
                 mention=True,
             )
 
+    async def _on_issue(self, payload: dict) -> None:
+        """`devin` label on an issue spawns a session — the issue tracker
+        becomes the mobile task queue."""
+        if payload.get("action") != "labeled":
+            return
+        label = (payload.get("label") or {}).get("name") or ""
+        if label.lower() != self.bot.settings.github_trigger_label.lower():
+            return
+        issue = payload.get("issue") or {}
+        repo = payload.get("repository") or {}
+        owner = (repo.get("owner") or {}).get("login") or ""
+        name = repo.get("name") or ""
+        if not (owner and name and issue.get("number")):
+            return
+        if (issue.get("pull_request")):
+            return  # PRs arrive through their own events
+        from .spawn import SpawnError, spawn_session  # local: import cycle
+
+        title = issue.get("title") or f"issue #{issue['number']}"
+        body = (issue.get("body") or "")[:4000]
+        url = issue.get("html_url") or ""
+        prompt = (
+            f"Work on GitHub issue {owner}/{name}#{issue['number']}:\n\n"
+            f"**{title}**\n\n{body}\n\n{url}"
+        )
+        try:
+            _, thread = await spawn_session(
+                self.bot, prompt=prompt, repos=[f"{owner}/{name}"],
+                title=title,
+            )
+            await thread.send(
+                f"Spawned by `{label}` label on {owner}/{name}#{issue['number']}."
+            )
+        except SpawnError as e:
+            log.warning("label trigger spawn failed for %s/%s#%s: %s",
+                        owner, name, issue.get("number"), e)
+
+    async def _on_review(self, payload: dict) -> None:
+        """PR review events → excerpt into the owning thread with a
+        Send-to-Devin button (the button re-fetches feedback at click time,
+        so nothing here needs persisting)."""
+        repo = payload.get("repository") or {}
+        pr = payload.get("pull_request") or {}
+        found = await self.db.binding_for_pr(
+            (repo.get("owner") or {}).get("login", ""),
+            repo.get("name", ""),
+            int(pr.get("number") or 0),
+        )
+        if found is None:
+            return
+        binding, row = found
+        rev = payload.get("review") or payload.get("comment") or {}
+        body = (rev.get("body") or "").strip()
+        author = ((rev.get("user") or {}).get("login")) or "someone"
+        if not body or author.endswith("[bot]"):
+            return
+        from .views import ReviewNotifyView  # local: views -> discord only, fine
+
+        where = f" on `{rev['path']}`" if rev.get("path") else ""
+        await self._post(
+            binding,
+            f"**{author}** reviewed {row.repo}#{row.number}{where}:\n"
+            f"> {body[:500]}",
+            view=ReviewNotifyView(
+                binding.session_id,
+                f"{row.owner}/{row.repo}#{row.number}",
+                self.bot.handle_component,
+            ),
+        )
+
     async def _apply(
         self, binding, row: PrRow, *, state: str | None = None,
         checks: str | None = None,
@@ -136,7 +210,10 @@ class WebhookServer:
             binding, f"PR #{row.number} → **{state}**", mention=mention
         )
 
-    async def _post(self, binding, text: str, *, mention: bool = False) -> None:
+    async def _post(
+        self, binding, text: str, *, mention: bool = False,
+        view: discord.ui.View | None = None,
+    ) -> None:
         try:
             chan = self.bot.get_channel(binding.thread_id) or (
                 await self.bot.fetch_channel(binding.thread_id)
@@ -148,7 +225,7 @@ class WebhookServer:
                 prefix = " ".join(
                     f"<@{u}>" for u in self.bot.settings.allowed_user_id_set
                 ) + " "
-            await chan.send(prefix + text)
+            await chan.send(prefix + text, view=view or discord.utils.MISSING)
         except Exception:
             log.warning("webhook post failed for thread %s", binding.thread_id)
 

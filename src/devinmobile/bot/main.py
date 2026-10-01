@@ -4,13 +4,14 @@ import logging
 import discord
 from discord import app_commands
 
-from ..acp_bridge import AcpBridge
+from ..acp_bridge import AcpBridge, SessionStream
 from ..config import Settings
 from ..db import Database
 from ..devin_client import DevinClient
 from ..embeds import status_embed
 from ..github_client import GithubClient, PullRef, parse_issue_ref
 from ..relay import Relay
+from ..scheduler import Scheduler
 from ..views import MergeConfirmView, dispatch
 from ..webhook_server import WebhookServer, maybe_start
 from .commands import register_commands
@@ -32,6 +33,8 @@ class DevinMobileBot(discord.Client):
         self.relay: Relay
         self._relay_task: asyncio.Task | None = None
         self._webhook: WebhookServer | None = None
+        self._scheduler: Scheduler | None = None
+        self._stream: SessionStream | None = None
 
     async def setup_hook(self) -> None:
         self.db = await Database.connect(self.settings.db_path)
@@ -77,6 +80,12 @@ class DevinMobileBot(discord.Client):
             self, self.devin, self.db, self.settings, self.github,
             component_handler=self.handle_component,
         )
+        if self.bridge.available and self.settings.acp_progress:
+            # Live turn progress via the bridge's session/update stream.
+            self._stream = SessionStream(self.bridge, on_update=self.relay.on_progress)
+            self.relay.streamer = self._stream
+        self._scheduler = Scheduler(self)
+        self._scheduler.start()
         self._webhook = await maybe_start(self, self.db, self.settings)
         register_commands(self)
         if self.settings.command_guild_id:
@@ -103,6 +112,8 @@ class DevinMobileBot(discord.Client):
             await self.github.aclose()
         if self._webhook:
             await self._webhook.stop()
+        if self._scheduler:
+            await self._scheduler.stop()
         await super().close()
 
     # ---- steering: anything an allowed user types in a bound thread goes to
@@ -116,11 +127,35 @@ class DevinMobileBot(discord.Client):
             return
         if message.author.id not in self.settings.allowed_user_id_set:
             return
+        content = message.content
+        attachments = [a.url for a in message.attachments] or None
+        if not content and message.attachments and self.settings.openai_api_key:
+            # Voice notes land as audio/* attachments — transcribe and steer.
+            from ..transcribe import transcribe  # local import: httpx lazily
+
+            voice = next(
+                (a for a in message.attachments
+                 if (a.content_type or "").startswith("audio/")
+                 or getattr(a, "waveform", None)),
+                None,
+            )
+            if voice is not None:
+                try:
+                    content = await transcribe(voice.url, self.settings.openai_api_key)
+                    attachments = [
+                        a.url for a in message.attachments if a is not voice
+                    ] or None
+                    if content:
+                        await message.reply(f"🎤 _{content}_", mention_author=False)
+                except Exception:
+                    log.exception("voice transcription failed")
+                    await message.add_reaction("🎤")
+                    return
         try:
             session = await self.devin.send_message(
                 binding.session_id,
-                message.content or "(attachment)",
-                attachment_urls=[a.url for a in message.attachments] or None,
+                content or "(attachment)",
+                attachment_urls=attachments,
                 message_as_user_id=self.settings.create_as_user_id,
             )
             # Same lock as the poll loop — an in-flight poll can't overwrite
@@ -235,6 +270,64 @@ class DevinMobileBot(discord.Client):
                 f"({self.settings.github_merge_method})?",
                 view=MergeConfirmView(session_id, pr_key, self.handle_component),
                 ephemeral=True,
+            )
+            return
+        if action == "pr_automerge":
+            row.auto_merge = not row.auto_merge
+            await self.db.upsert_pr(row)
+            state = "ON — merges when CI goes green" if row.auto_merge else "off"
+            if interaction.message:
+                binding = await self.db.get_binding(session_id)
+                if binding is not None:
+                    try:
+                        await self.relay._refresh_pr_card(binding, row)
+                    except Exception:  # noqa: BLE001
+                        pass
+            await interaction.response.send_message(
+                f"Auto-merge {state} for {ref.key}.", ephemeral=True
+            )
+            return
+        if action == "fix_ci":
+            await interaction.response.defer(ephemeral=True)
+            try:
+                fails = await self.github.get_failed_checks(ref)
+                lines = "\n".join(
+                    f"- {f['name']}: {f['conclusion']} ({f['url']})"
+                    for f in fails[:10]
+                ) or "- (no failed check runs found — inspect the PR)"
+                await self.devin.send_message(
+                    session_id,
+                    f"CI failed on {ref.key} — please investigate and fix:\n{lines}",
+                    message_as_user_id=self.settings.create_as_user_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                await interaction.followup.send(f"Failed: `{e}`", ephemeral=True)
+                return
+            await interaction.followup.send(
+                "Sent the failing checks to Devin.", ephemeral=True
+            )
+            return
+        if action == "send_review":
+            await interaction.response.defer(ephemeral=True)
+            try:
+                feedback = await self.github.get_review_feedback(ref)
+                lines = "\n".join(
+                    f"- {f['author']}"
+                    + (f" on `{f['path']}`" if f.get("path") else "")
+                    + (f" [{f['state']}]" if f.get("state") else "")
+                    + f": {f['body'][:400]}"
+                    for f in feedback
+                ) or "- (no review comments found)"
+                await self.devin.send_message(
+                    session_id,
+                    f"Review feedback on {ref.key} — please address it:\n{lines}",
+                    message_as_user_id=self.settings.create_as_user_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                await interaction.followup.send(f"Failed: `{e}`", ephemeral=True)
+                return
+            await interaction.followup.send(
+                "Sent the review feedback to Devin.", ephemeral=True
             )
             return
 

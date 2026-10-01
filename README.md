@@ -18,7 +18,8 @@ approval → anything you type in the thread steers the session.
 - **Real model selection** — the full `/model` catalog (SWE-2 variants, Ultra,
   Opus 5.5, GPT-6.x Sol, Fusion…) via the internal ACP bridge, not just v3's
   five `devin_mode` tiers
-- **Live relay** — Devin's messages stream into one thread per session
+- **Live relay** — Devin's messages stream into one thread per session;
+  a "Working…" message tracks live tool calls via the ACP bridge
 - **Phone-friendly notifications** — @-mentions on turn end / real questions /
   approval requests / failures / PR+CI transitions; silent on routine
   suspensions
@@ -26,6 +27,12 @@ approval → anything you type in the thread steers the session.
   (auto-resumes suspended sessions); attachments pass through as URLs
 - **PR cards** — when a session opens a PR, the thread gets a card with
   state + CI status and **Merge / Approve / Close** buttons (GitHub App)
+- **PR loop, closed** — Merge/Approve/Close/Auto-merge buttons, CI-failure
+  "Ask Devin to fix", review comments relayed back to the session
+- **Automation** — `/schedule` recurring tasks, `/devin-all` repo fan-out,
+  `devin` label on a GitHub issue auto-spawns a session (webhook)
+- **Guardrails** — ACU-cap pings, silence watchdog, `/kill` parking,
+  voice-note steering via Whisper
 - **Issue/branch intake** — `/devin issue:#42 branch:feat-x` feeds GitHub
   context into the prompt
 - **Buttons** — Open · Refresh · Approve · SSH instructions

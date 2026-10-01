@@ -27,10 +27,45 @@ first — so `prompt` always leads; `model` is the first optional chip.
 `tags`, `structured_output_schema`, or `MAX_ACU_LIMIT` — those only exist on
 the plain v3 path.
 
+### `/devin-all`
+
+Fan-out: one session per repo, one thread each.
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `prompt` | required | The task, run once per repo |
+| `repos` | required, autocomplete | Comma-separated `owner/repo` list (2+) |
+| `model` / `mode` / `title` | optional | Same semantics as `/devin`; `title` becomes a prefix (`title · repo`) |
+
+### `/schedule`
+
+Recurring sessions — the task queue that runs while you sleep.
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `prompt` | required | What Devin does each run |
+| `every` | required | `30m`, `6h`, `1d`, … (min 5m) |
+| `repo` | optional, autocomplete | Repo(s) for each run |
+| `model` | optional | Model alias (bridge) |
+
+Rows persist in SQLite and survive restarts. A downtime doesn't
+catch-fire the backlog — `next_run_at` slides forward from the actual fire
+time.
+
+### `/schedules` / `/unschedule <id>`
+
+List recurring tasks (next run, interval, state) / delete one.
+
 ### `/sessions`
 
-Lists the last 10 sessions this bot started, with status and a link to each
-thread.
+Lists the last 10 sessions this bot started — status, model, ACU burn,
+and a link to each thread.
+
+### `/kill [session_id]`
+
+Parks a session: stops tracking, archives the thread, posts a marker.
+Defaults to the current thread's session when run inside one. Also tries a
+v3 `DELETE` (undocumented — best-effort to stop ACU burn sooner).
 
 ### `/devin-status [session_id]`
 
@@ -45,9 +80,16 @@ Refreshes a session's status embed on demand (defaults to the most recent).
 - **Steering**: type anything → forwarded via `POST /messages` → ✅ reaction
   = delivered, ❌ = failed. A suspended session auto-resumes on message.
   Discord attachments ride along as `attachment_urls`.
-- **Liveness**: the bot shows "typing…" in the thread while the session is
-  mid-turn (status `running` without a `waiting_for_*` detail). v3 exposes
-  no tool-call progress — the dots are the "still working" signal.
+- **Liveness**: the bot shows "typing…" while the session is mid-turn, and
+  (when the bridge is available) a single **"Working…"** message tracks the
+  live tool calls — `Read /path/x.py`, `Run pytest -x` — edited in place
+  every ~3s and deleted when the turn ends. The transcript stays clean;
+  set `ACP_PROGRESS=0` to disable.
+- **Voice steering**: with `OPENAI_API_KEY` set, a voice message in a bound
+  thread is transcribed (Whisper) and sent to the session as text — the
+  transcript echoes back as a quote so you can see what was sent.
+- **Silence watchdog**: a session that's `running` but quiet for
+  `SILENCE_ALERT_MINUTES` (default 20) posts one quiet note — no ping.
 
 ## Buttons (anchor embed)
 
@@ -70,10 +112,26 @@ still appear as plain links in the anchor embed):
 - **Merge** — asks for an ephemeral confirmation first, then merges with
   `GITHUB_MERGE_METHOD` (default squash)
 - **Approve** — posts an `APPROVE` review as the GitHub App
+- **Auto-merge** — opt-in toggle: the relay merges the moment CI reports
+  green. Off by default; the card footer shows the flag
 - **Close PR** — closes without merging
 
 State transitions (opened → merged/closed, CI green → red) also post into
-the thread; CI failures and merges ping.
+the thread; CI failures and merges ping. A **CI failing ❌** notice carries
+an **Ask Devin to fix** button that forwards the failing check names back
+to the session.
+
+With webhooks on, PR review comments post into the thread too, with a
+**Send to Devin** button that feeds the feedback back to the session —
+the whole review → fix → merge loop stays on the phone.
+
+## Label-triggered sessions
+
+With the webhook receiver enabled, adding the `devin` label
+(`GITHUB_TRIGGER_LABEL`) to a GitHub issue spawns a session automatically —
+the issue title+body become the prompt, the repo is attached, and the new
+thread notes where it came from. Fill the issue tracker from anywhere;
+Devin picks the work up.
 
 ## Notifications
 
@@ -90,7 +148,9 @@ the thread; CI failures and merges ping.
 | `suspended` (`inactivity`/`user_request`) | ❌ | `Session suspended (…) — reply here to resume it.` |
 | PR merged / closed | ✅ / ❌ | `PR #n merged` / `PR #n closed.` |
 | PR CI → success | ✅ | `PR #n — CI green ✅` |
-| PR CI → failure | ✅ | `PR #n — CI failing ❌` |
+| PR CI → failure | ✅ | `PR #n — CI failing ❌` (with Fix-CI button) |
+| ACU ≥80% / ≥100% of `MAX_ACU_LIMIT` | ✅ | `ACU usage is nearing/hit the cap: N of M ACUs` |
+| running + silent > `SILENCE_ALERT_MINUTES` | ❌ | `Devin has been quiet for ~Nmin — likely still working.` |
 
 Notification texts live in `classify_transition` in `src/devinmobile/relay.py`.
 

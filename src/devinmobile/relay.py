@@ -3,17 +3,20 @@ import json
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass
 
 import discord
 
+from .acp_bridge import SessionStream
 from .config import Settings
 from .db import Binding, Database, PrRow
 from .devin_client import DevinClient
 from .embeds import completion_embed, pr_embed, status_embed
 from .github_client import GithubClient, PullRef, parse_pr_url
 from .models import Session, SessionMessage
-from .views import ComponentHandler, PRView
+from .progress import ProgressTracker, summarize_update
+from .views import ComponentHandler, FixCIView, PRView
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +136,7 @@ class Relay:
         settings: Settings,
         github: "GithubClient | None" = None,
         component_handler: "ComponentHandler | None" = None,
+        streamer: "SessionStream | None" = None,
     ) -> None:
         self.bot = bot
         self.devin = devin
@@ -140,6 +144,8 @@ class Relay:
         self.settings = settings
         self.github = github
         self._component_handler = component_handler
+        self.streamer = streamer
+        self.progress = ProgressTracker(self._thread)
         self._locks: dict[str, asyncio.Lock] = {}
         self._repoll: set[str] = set()  # sessions needing one more pass
         self._tasks: set[asyncio.Task] = set()
@@ -168,6 +174,8 @@ class Relay:
     async def aclose(self) -> None:
         for t in self._tasks:
             t.cancel()
+        if self.streamer is not None:
+            await self.streamer.aclose()
 
     async def run_forever(self) -> None:
         while True:
@@ -191,9 +199,11 @@ class Relay:
 
     async def _poll(self, binding: Binding) -> None:
         cursor = binding.msg_cursor
+        had_activity = False
         while True:
             page = await self.devin.list_messages(binding.session_id, after=cursor)
             for m in relayable(page.items, binding.seen_event_ids):
+                had_activity = True
                 clean, _ = extract_attachments(m.message or "")
                 if clean:
                     # persisted on the binding so a waiting_for_user flip in a
@@ -213,6 +223,12 @@ class Relay:
         notif = classify_transition(
             binding.status, binding.status_detail, session, binding.last_msg
         )
+        had_activity = had_activity or notif is not None
+        if had_activity:
+            binding.last_activity_at = int(time.time())
+            binding.quiet_alerted = False
+        binding.acus = session.acus_consumed
+        await self._check_acu(binding, session)
         if session.title:
             binding.title = session.title
         binding.status = session.status
@@ -222,10 +238,73 @@ class Relay:
         await self._update_anchor(binding, session, complete=is_complete)
         if notif:
             await self._notify(binding, session, notif)
+        await self._watchdog(binding, session)
         # Derived from the live status so a stale write can't strand a
         # reactivated thread in the parked state.
         binding.active = session.status not in QUIET_STATUSES
         await self.db.upsert_binding(binding)
+        # Attach the session to the live-progress stream — idempotent, and
+        # self-heals after a stream reconnect (attached set is cleared then).
+        if self.streamer is not None and binding.active:
+            try:
+                await self.streamer.attach(binding.session_id)
+            except Exception:  # noqa: BLE001 — progress is best-effort
+                log.debug("stream attach failed for %s", binding.session_id)
+
+    async def on_progress(self, session_id: str, update: dict) -> None:
+        """SessionStream callback — a session/update notification arrived on
+        the bridge socket for an attached session."""
+        line = summarize_update(update)
+        if line is None:
+            return
+        binding = await self.db.get_binding(session_id)
+        if binding is None:
+            return
+        await self.progress.push(binding, line)
+
+    # ---- budget + liveness ------------------------------------------------
+
+    async def _check_acu(self, binding: Binding, session: Session) -> None:
+        """Ping once when ACU burn crosses 80%/100% of the configured cap —
+        the cap being hit mid-task is exactly when a phone ping matters."""
+        cap = self.settings.max_acu_limit
+        if not cap or cap <= 0:
+            return
+        frac = session.acus_consumed / cap
+        for bit, threshold in ((1, 0.8), (2, 1.0)):
+            if frac >= threshold and not binding.acu_warned & bit:
+                binding.acu_warned |= bit
+                label = (
+                    "hit the cap" if threshold >= 1.0 else "is nearing the cap"
+                )
+                await self._notify(
+                    binding,
+                    session,
+                    Notification(
+                        "acu",
+                        f"ACU usage {label}: {session.acus_consumed:g} of "
+                        f"{cap} ACUs consumed.",
+                    ),
+                )
+
+    async def _watchdog(self, binding: Binding, session: Session) -> None:
+        """A 'running' session that hasn't said anything in a while posts one
+        quiet note — never a mention, it's almost always still working."""
+        minutes = self.settings.silence_alert_minutes
+        if minutes <= 0 or session.status != "running" or binding.quiet_alerted:
+            return
+        anchor = binding.last_activity_at or binding.created_at
+        elapsed = time.time() - anchor
+        if elapsed < minutes * 60:
+            return
+        binding.quiet_alerted = True
+        thread = await self._thread(binding)
+        if thread is None:
+            return
+        await thread.send(
+            f"Devin has been quiet for ~{int(elapsed // 60)}min — "
+            "likely still working. Reply here to nudge it."
+        )
 
     # Statuses that mean "Devin is actively working right now". waiting_for_*
     # details mean the turn ended — no typing dots for a parked turn.
@@ -313,6 +392,33 @@ class Relay:
         state = "merged" if data.get("merged") else data.get("state", row.state)
         checks = await self.github.get_checks(ref)  # type: ignore[union-attr]
         row.pr_title = data.get("title") or row.pr_title
+        thread = await self._thread(binding)
+        mention = " ".join(f"<@{u}>" for u in self.settings.allowed_user_id_set)
+        label = f"{row.repo}#{row.number}" if row.repo else f"PR #{row.number}"
+
+        # Opt-in auto-merge runs every poll while conditions hold — it can't
+        # piggyback on the transition dedupe (the flag may be toggled on
+        # AFTER CI went green, when no further transition will ever arrive).
+        if row.auto_merge and state == "open" and checks == "success":
+            try:
+                await self.github.merge_pr(  # type: ignore[union-attr]
+                    ref, method=self.settings.github_merge_method
+                )
+                state = "merged"
+                if thread is not None:
+                    await thread.send(f"{mention} {label} auto-merged 🟣")
+                # The auto-merge notice IS the merge notification — consume
+                # the transition so the block below doesn't re-post it.
+                row.state, row.checks_state = state, checks
+                row.last_notified = f"{state}|{checks}"
+                await self.db.upsert_pr(row)
+                await self._refresh_pr_card(binding, row)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.warning("auto-merge failed for %s: %s", row.pr_url, e)
+                if thread is not None:
+                    await thread.send(f"{mention} {label} auto-merge failed: `{e}`")
+                row.auto_merge = False  # don't retry the same failure forever
 
         # Composite transition key — notify once per distinct outcome.
         key = f"{state}|{checks}"
@@ -320,12 +426,7 @@ class Relay:
             row.state, row.checks_state = state, checks
             await self.db.upsert_pr(row)
             return
-        thread = await self._thread(binding)
         if thread is not None:
-            mention = " ".join(
-                f"<@{u}>" for u in self.settings.allowed_user_id_set
-            )
-            label = f"{row.repo}#{row.number}" if row.repo else f"PR #{row.number}"
             if state == "merged":
                 await thread.send(f"{mention} {label} merged 🟣")
             elif state == "closed" and row.state != "closed":
@@ -333,7 +434,15 @@ class Relay:
             elif checks == "success" and row.checks_state != "success":
                 await thread.send(f"{mention} {label} — CI green ✅")
             elif checks == "failure" and row.checks_state != "failure":
-                await thread.send(f"{mention} {label} — CI failing ❌")
+                pr_key = ref.key
+                view = (
+                    FixCIView(binding.session_id, pr_key, self._component_handler)
+                    if self._component_handler
+                    else discord.utils.MISSING
+                )
+                await thread.send(
+                    f"{mention} {label} — CI failing ❌", view=view
+                )
         row.state, row.checks_state, row.last_notified = state, checks, key
         await self.db.upsert_pr(row)
         await self._refresh_pr_card(binding, row)
@@ -406,6 +515,10 @@ class Relay:
         thread = await self._thread(binding)
         if thread is None:
             return
+        # The turn ended (or the session died) — the live progress message is
+        # stale now; drop it so the thread reads as a clean transcript.
+        if notif.kind in ("complete", "input", "turn_end", "error"):
+            await self.progress.done(binding)
         # No mention => no push notification: routine transitions stay readable
         # in-channel without buzzing the phone.
         mentions = (
@@ -415,11 +528,38 @@ class Relay:
         )
         text = mentions + notif.text
         if notif.kind == "complete":
-            await thread.send(
-                text,
-                embed=completion_embed(
-                    session, fallback_title=binding.title, model=binding.model
-                ),
+            embed = completion_embed(
+                session, fallback_title=binding.title, model=binding.model
             )
+            await self._add_diffstat(binding, embed)
+            await thread.send(text, embed=embed)
         else:
             await thread.send(text)
+
+    async def _add_diffstat(self, binding: Binding, embed: discord.Embed) -> None:
+        """If the session produced exactly one PR, append a GitHub-sourced
+        +x/−y diffstat — the question 'how big was the change' always follows
+        'session finished' on a phone."""
+        if self.github is None:
+            return
+        prs = await self.db.prs_for_session(binding.session_id)
+        if len(prs) != 1 or not (prs[0].owner and prs[0].repo and prs[0].number):
+            return
+        row = prs[0]
+        try:
+            files = await self.github.get_pr_files(
+                PullRef(owner=row.owner, repo=row.repo, number=row.number)
+            )
+        except Exception:  # noqa: BLE001 — diffstat is decoration
+            return
+        if not files:
+            return
+        adds = sum(f["additions"] for f in files)
+        dels = sum(f["deletions"] for f in files)
+        top = ", ".join(f"`{f['filename']}`" for f in files[:4])
+        embed.add_field(
+            name="Diff",
+            value=f"+{adds} −{dels} across {len(files)} file(s): {top}"
+                  + (" …" if len(files) > 4 else ""),
+            inline=False,
+        )

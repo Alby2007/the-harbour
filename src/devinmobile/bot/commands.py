@@ -1,17 +1,16 @@
-import asyncio
 import logging
+import re
+import time
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 
-from ..acp_bridge import MODEL_ALIASES, BridgeError, ConfigOption, resolve_option
-from ..db import Binding
-from ..devin_client import SESSION_TAG
+from ..acp_bridge import MODEL_ALIASES
+from ..db import ScheduleRow
 from ..embeds import status_embed
 from ..github_client import parse_issue_ref
-from ..models import Session
-from ..views import SessionView
+from ..spawn import SpawnError, spawn_session
 
 if TYPE_CHECKING:
     from .main import DevinMobileBot
@@ -21,6 +20,18 @@ log = logging.getLogger(__name__)
 DEVIN_MODES = ["lite", "normal", "fast", "ultra", "fusion"]
 
 NOT_ALLOWED = "This bot is locked to its owner."
+
+# /schedule every: values — 30m, 6h, 1d
+EVERY_RE = re.compile(r"^(\d+)([mhd])$", re.IGNORECASE)
+_EVERY_SECONDS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def parse_every(text: str) -> int | None:
+    """'30m'/'6h'/'1d' -> seconds, or None."""
+    m = EVERY_RE.match(text.strip())
+    if not m:
+        return None
+    return int(m.group(1)) * _EVERY_SECONDS[m.group(2).lower()]
 
 
 async def model_autocomplete(
@@ -59,31 +70,15 @@ async def repo_autocomplete(
     return out[:25]
 
 
+def _split_repos(repo: str | None) -> list[str] | None:
+    return [r.strip() for r in repo.split(",") if r.strip()] if repo else None
+
+
 def register_commands(bot: "DevinMobileBot") -> None:
     tree = bot.tree
 
     def _allowed(interaction: discord.Interaction) -> bool:
         return interaction.user.id in bot.settings.allowed_user_id_set
-
-    async def _hub() -> discord.TextChannel | None:
-        if bot.settings.hub_channel_id is None:
-            return None
-        chan = bot.get_channel(bot.settings.hub_channel_id) or await bot.fetch_channel(
-            bot.settings.hub_channel_id
-        )
-        return chan if isinstance(chan, discord.TextChannel) else None
-
-    async def _wait_for_v3(session_id: str) -> Session:
-        """Bridge sessions materialize for the v3 API once the first prompt
-        lands — poll briefly until get_session succeeds."""
-        last: Exception | None = None
-        for _ in range(8):
-            try:
-                return await bot.devin.get_session(session_id)
-            except Exception as e:  # noqa: BLE001 — any HTTP error just means "not yet"
-                last = e
-                await asyncio.sleep(2.5)
-        raise BridgeError(f"session {session_id} not visible to the API yet") from last
 
     @tree.command(name="devin", description="Start a Devin Cloud session")
     @app_commands.describe(
@@ -111,13 +106,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
-        hub = await _hub()
-        if hub is None:
-            await interaction.response.send_message(
-                "HUB_CHANNEL_ID is not configured or isn't a text channel.", ephemeral=True
-            )
-            return
-        repos = [r.strip() for r in repo.split(",") if r.strip()] if repo else None
+        repos = _split_repos(repo)
         if issue and not bot.settings.github_enabled:
             await interaction.response.send_message(
                 "`issue:` needs the GitHub App configured "
@@ -125,28 +114,6 @@ def register_commands(bot: "DevinMobileBot") -> None:
             )
             return
         await interaction.response.defer()
-
-        if repos and bot.bridge.available:
-            # Canonicalize against the live catalog even on the v3 path —
-            # v3 silently drops repo values it doesn't recognize, same trap
-            # as the bridge. Bridge off → pass raw (nothing to check against).
-            # (Post-defer: a cold catalog() call can exceed the 3s window.)
-            try:
-                cat = await bot.bridge.catalog()
-                repo_opts = [
-                    ConfigOption(name=o.get("name", ""), value=o.get("value", ""))
-                    for o in (cat.get("repos", {}).get("options") or [])
-                ]
-                if repo_opts:
-                    repos = [
-                        resolve_option(r, repo_opts, what="repo").value
-                        for r in repos
-                    ]
-            except BridgeError as e:
-                await interaction.followup.send(f"`{e}`", ephemeral=True)
-                return
-            except Exception:  # noqa: BLE001 — catalog fetch failed; pass raw
-                pass
 
         if issue:
             default_repo = repos[0] if repos else None
@@ -175,79 +142,140 @@ def register_commands(bot: "DevinMobileBot") -> None:
         if branch:
             prompt += f"\n\nBase your work on branch `{branch}` (checkout from origin/{branch})."
 
-        model_label: str | None = None
-        # model beats mode; the env default only applies when neither is given
-        effective_model = model or (bot.settings.default_model if mode is None else None)
-        if effective_model:
-            # Model selection needs the ACP bridge (CLI credentials); v3 only
-            # exposes devin_mode. The bridge session joins the normal pipeline
-            # once its first prompt lands.
-            if not bot.bridge.available:
-                await interaction.followup.send(
-                    "Model selection needs `devin auth login` on the bot host "
-                    "(no CLI credentials found). Run without `model:` or log in first.",
-                    ephemeral=True,
-                )
-                return
-            try:
-                bs = await bot.bridge.create_cloud_session(
-                    prompt, model=effective_model, repos=repos
-                )
-                session = await _wait_for_v3(bs.session_id)
-                model_label = bs.model_label
-            except BridgeError as e:
-                await interaction.followup.send(f"Bridge create failed: `{e}`", ephemeral=True)
-                return
-            except Exception as e:
-                await interaction.followup.send(
-                    f"Session create failed: `{e}`", ephemeral=True
-                )
-                return
-        else:
-            try:
-                session = await bot.devin.create_session(
-                    prompt=prompt,
-                    repos=repos,
-                    devin_mode=mode or bot.settings.devin_mode,
-                    title=title,
-                    tags=[SESSION_TAG],
-                    max_acu_limit=bot.settings.max_acu_limit,
-                    create_as_user_id=bot.settings.create_as_user_id,
-                )
-            except Exception as e:
-                await interaction.followup.send(
-                    f"Session create failed: `{e}`", ephemeral=True
-                )
-                return
-
-        thread_name = (title or prompt)[:90] or session.session_id
-        thread = await hub.create_thread(
-            name=thread_name, type=discord.ChannelType.public_thread
-        )
         try:
-            await thread.join()
-        except discord.HTTPException:
-            pass
-        anchor = await thread.send(
-            embed=status_embed(session, fallback_title=title, model=model_label),
-            view=SessionView(session.session_id, session.url, bot.handle_component),
-        )
-        binding = Binding(
-            session_id=session.session_id,
-            thread_id=thread.id,
-            channel_id=hub.id,
-            anchor_msg_id=anchor.id,
-            title=title,
-            url=session.url,
-            status=session.status,
-            status_detail=session.status_detail,
-            model=model_label,
-        )
-        await bot.db.upsert_binding(binding)
+            session, thread = await spawn_session(
+                bot, prompt=prompt, repos=repos, model=model, mode=mode, title=title,
+            )
+        except SpawnError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
         await interaction.followup.send(f"Session started → {thread.mention}")
-        # Devin's first ack lands within seconds — poll immediately instead
-        # of waiting for the first scheduled tick.
-        bot.relay.request_poll(binding)
+
+    @tree.command(
+        name="devin-all", description="Start one session per repo (fan-out)"
+    )
+    @app_commands.describe(
+        prompt="What Devin should do in each repo",
+        repos="Comma-separated owner/repo list (2+)",
+        model="Model picker — overrides mode",
+        mode="Agent mode (default from env)",
+        title="Thread title prefix",
+    )
+    @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in DEVIN_MODES])
+    @app_commands.autocomplete(model=model_autocomplete, repos=repo_autocomplete)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def devin_all_cmd(
+        interaction: discord.Interaction,
+        prompt: str,
+        repos: str,
+        model: str | None = None,
+        mode: str | None = None,
+        title: str | None = None,
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        repo_list = _split_repos(repos) or []
+        if len(repo_list) < 2:
+            await interaction.response.send_message(
+                "Give at least two repos, comma-separated.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        spawned, failed = [], []
+        for r in repo_list:
+            try:
+                _, thread = await spawn_session(
+                    bot, prompt=prompt, repos=[r], model=model, mode=mode,
+                    title=f"{title + ' · ' if title else ''}{r}",
+                )
+                spawned.append(f"{r} → {thread.mention}")
+            except SpawnError as e:
+                failed.append(f"{r}: {e}")
+        text = "**Fan-out:**\n" + "\n".join(spawned)
+        if failed:
+            text += "\n\n**Failed:**\n" + "\n".join(f"`{f}`" for f in failed)
+        await interaction.followup.send(text)
+
+    @tree.command(name="schedule", description="Run a prompt on a recurring interval")
+    @app_commands.describe(
+        prompt="What Devin should do each run",
+        every="Interval: 30m, 6h, 1d, …",
+        repo="org/repo (comma-separate for several)",
+        model="Model picker (optional)",
+    )
+    @app_commands.autocomplete(model=model_autocomplete, repo=repo_autocomplete)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def schedule_cmd(
+        interaction: discord.Interaction,
+        prompt: str,
+        every: str,
+        repo: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        interval = parse_every(every)
+        if interval is None or interval < 300:
+            await interaction.response.send_message(
+                "Interval must be like `30m`, `6h`, `1d` (min 5m).", ephemeral=True
+            )
+            return
+        row = ScheduleRow(
+            id=0,
+            prompt=prompt,
+            repos=_split_repos(repo) or [],
+            model=model,
+            interval_seconds=interval,
+            next_run_at=int(time.time()) + interval,
+        )
+        row.id = await bot.db.add_schedule(row)
+        await interaction.response.send_message(
+            f"Scheduled #{row.id} — every {every}, first run in {every}.\n"
+            f"`{prompt[:80]}` on {', '.join(row.repos) or 'default repos'}",
+            ephemeral=True,
+        )
+
+    @tree.command(name="schedules", description="List recurring Devin tasks")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def schedules_cmd(interaction: discord.Interaction) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        rows = await bot.db.all_schedules()
+        if not rows:
+            await interaction.response.send_message("No schedules.", ephemeral=True)
+            return
+        embed = discord.Embed(title="Recurring Devin tasks")
+        now = int(time.time())
+        for s in rows:
+            state = "on" if s.enabled else "off"
+            due = "due now" if s.next_run_at <= now else f"next <t:{s.next_run_at}:R>"
+            embed.add_field(
+                name=f"#{s.id} · every {s.interval_seconds // 60}m · {state}",
+                value=(
+                    f"`{s.prompt[:80]}`\n{', '.join(s.repos) or 'default repos'} · {due}"
+                ),
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(name="unschedule", description="Delete a recurring task")
+    @app_commands.describe(schedule_id="Schedule id from /schedules")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def unschedule_cmd(interaction: discord.Interaction, schedule_id: int) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if await bot.db.delete_schedule(schedule_id):
+            await interaction.response.send_message(
+                f"Deleted schedule #{schedule_id}.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"No schedule #{schedule_id}.", ephemeral=True
+            )
 
     @tree.command(name="sessions", description="List sessions started through this bot")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -264,12 +292,58 @@ def register_commands(bot: "DevinMobileBot") -> None:
             status = b.status or "?"
             if b.status_detail:
                 status += f" — {b.status_detail}"
+            bits = [f"`{status}`"]
+            if b.model:
+                bits.append(f"`{b.model}`")
+            if b.acus:
+                bits.append(f"{b.acus:g} ACU")
+            bits.append(f"<#{b.thread_id}>")
             embed.add_field(
                 name=(b.title or b.session_id)[:100],
-                value=f"`{status}` · <#{b.thread_id}>",
+                value=" · ".join(bits),
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(name="kill", description="Park a session (stop tracking it)")
+    @app_commands.describe(session="Session id (default: this thread's session)")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def kill_cmd(
+        interaction: discord.Interaction, session: str | None = None
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        binding = None
+        if session:
+            binding = await bot.db.get_binding(session)
+        elif isinstance(interaction.channel, discord.Thread):
+            binding = await bot.db.get_binding_by_thread(interaction.channel.id)
+        if binding is None:
+            await interaction.response.send_message(
+                "No such session — run inside its thread or pass `session:`.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        # Best-effort terminate — v3 has no documented DELETE, so parking +
+        # archiving is the contract; the API call just stops ACU burn sooner.
+        try:
+            await bot.devin.terminate_session(binding.session_id)
+        except Exception:  # noqa: BLE001 — v3 may not support it; local park is enough
+            pass
+        binding.active = False
+        await bot.db.upsert_binding(binding)
+        thread = await interaction.client.fetch_channel(binding.thread_id)
+        if isinstance(thread, discord.Thread):
+            await thread.send("Session parked — no longer tracked.")
+            try:
+                await thread.edit(archived=True)
+            except discord.HTTPException:
+                pass
+        await interaction.followup.send(
+            f"Parked `{binding.session_id}` and archived its thread.", ephemeral=True
+        )
 
     @tree.command(name="devin-status", description="Refresh a session's status")
     @app_commands.describe(session="Session id (default: most recent)")
@@ -292,5 +366,6 @@ def register_commands(bot: "DevinMobileBot") -> None:
         await interaction.response.defer(ephemeral=True)
         sess = await bot.devin.get_session(binding.session_id)
         await interaction.followup.send(
-            embed=status_embed(sess, fallback_title=binding.title), ephemeral=True
+            embed=status_embed(sess, fallback_title=binding.title),
+            ephemeral=True,
         )

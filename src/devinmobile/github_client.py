@@ -212,6 +212,78 @@ class GithubClient:
         )
         return checks_state(runs.get("check_runs", []))
 
+    async def get_failed_checks(self, pr: PullRef) -> list[dict[str, Any]]:
+        """Check runs that ended badly on the PR head — feeds the Fix-CI
+        button's message to Devin. Logs aren't fetched (huge); the html_url
+        links out."""
+        data = await self.get_pr(pr)
+        sha = data.get("head", {}).get("sha")
+        if not sha:
+            return []
+        runs = await self._req(
+            "GET",
+            f"/repos/{pr.owner}/{pr.repo}/commits/{sha}/check-runs",
+        )
+        bad = {"failure", "cancelled", "timed_out", "action_required"}
+        return [
+            {
+                "name": r.get("name") or "check",
+                "conclusion": r.get("conclusion") or "?",
+                "url": r.get("html_url") or "",
+            }
+            for r in runs.get("check_runs", [])
+            if r.get("conclusion") in bad
+        ]
+
+    async def get_pr_files(self, pr: PullRef) -> list[dict[str, Any]]:
+        """Per-file diffstat for the completion card."""
+        files = await self._req(
+            "GET", f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/files"
+        )
+        return [
+            {
+                "filename": f.get("filename") or "?",
+                "additions": f.get("additions") or 0,
+                "deletions": f.get("deletions") or 0,
+            }
+            for f in (files or [])
+        ]
+
+    async def get_review_feedback(self, pr: PullRef) -> list[dict[str, Any]]:
+        """Latest review comments + review bodies, newest last — what the
+        Send-to-Devin button hands to the session."""
+        comments = await self._req(
+            "GET",
+            f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/comments",
+        )
+        reviews = await self._req(
+            "GET",
+            f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews",
+        )
+        out: list[dict[str, Any]] = []
+        for c in comments or []:
+            body = (c.get("body") or "").strip()
+            if body:
+                out.append({
+                    "author": (c.get("user") or {}).get("login") or "?",
+                    "body": body,
+                    "path": c.get("path"),
+                    "kind": "comment",
+                    "at": c.get("created_at") or "",
+                })
+        for r in reviews or []:
+            body = (r.get("body") or "").strip()
+            if body:
+                out.append({
+                    "author": (r.get("user") or {}).get("login") or "?",
+                    "body": body,
+                    "state": r.get("state"),
+                    "kind": "review",
+                    "at": r.get("submitted_at") or "",
+                })
+        out.sort(key=lambda x: x["at"])
+        return out[-15:]
+
     async def merge_pr(self, pr: PullRef, method: str = "squash") -> dict[str, Any]:
         return await self._req(
             "PUT",

@@ -5,7 +5,8 @@ import discord
 
 PREFIX = "dvm"
 ACTIONS = ("ssh", "refresh", "approve",
-           "pr_merge", "pr_merge_go", "pr_approve", "pr_close")
+           "pr_merge", "pr_merge_go", "pr_approve", "pr_close", "pr_automerge",
+           "fix_ci", "send_review")
 
 ComponentHandler = Callable[[discord.Interaction, str, str, str | None], Awaitable[None]]
 
@@ -81,6 +82,7 @@ class PRView(discord.ui.View):
         for action, label, style in (
             ("pr_merge", "Merge", discord.ButtonStyle.success),
             ("pr_approve", "Approve", discord.ButtonStyle.secondary),
+            ("pr_automerge", "Auto-merge", discord.ButtonStyle.secondary),
             ("pr_close", "Close PR", discord.ButtonStyle.danger),
         ):
             self.add_item(_CbButton(
@@ -89,6 +91,34 @@ class PRView(discord.ui.View):
                 handler=handler,
                 style=style,
             ))
+
+
+class FixCIView(discord.ui.View):
+    """One button posted with a CI-failure notice — forwards the failing
+    check names back to the Devin session so it can fix them."""
+
+    def __init__(self, session_id: str, pr_key: str, handler: ComponentHandler) -> None:
+        super().__init__(timeout=None)
+        self.add_item(_CbButton(
+            label="Ask Devin to fix",
+            custom_id=make_custom_id("fix_ci", session_id, pr_key),
+            handler=handler,
+            style=discord.ButtonStyle.primary,
+        ))
+
+
+class ReviewNotifyView(discord.ui.View):
+    """Button on a relayed PR review — sends the review feedback to the
+    session as a steering message."""
+
+    def __init__(self, session_id: str, pr_key: str, handler: ComponentHandler) -> None:
+        super().__init__(timeout=None)
+        self.add_item(_CbButton(
+            label="Send to Devin",
+            custom_id=make_custom_id("send_review", session_id, pr_key),
+            handler=handler,
+            style=discord.ButtonStyle.secondary,
+        ))
 
 
 class MergeConfirmView(discord.ui.View):

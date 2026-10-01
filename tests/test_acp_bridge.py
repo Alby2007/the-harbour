@@ -1,6 +1,7 @@
 """Tests for the ACP bridge: a fake bridge speaks JSON-RPC over a real
 WebSocket (aiohttp test server on localhost)."""
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from devinmobile.acp_bridge import (
     AcpBridge,
     BridgeError,
     ConfigOption,
+    SessionStream,
     resolve_option,
 )
 
@@ -48,6 +50,9 @@ class FakeBridgeServer:
         self.prompt_updates_before_response = True
         self.fail_on: dict[str, dict[str, Any]] = {}
         self.blueprints: list[dict[str, Any]] = []
+        # pushed to the client right after a session/load response — models
+        # the live stream: loaded sockets keep streaming session/update
+        self.post_load_updates: list[dict[str, Any]] = []
         self.server = TestServer(web.Application())
 
     async def start(self) -> str:
@@ -101,6 +106,13 @@ class FakeBridgeServer:
                 result = {}
             await ws.send_str(json.dumps(
                 {"jsonrpc": "2.0", "id": rid, "result": result}))
+            if method == "session/load":
+                for u in self.post_load_updates:
+                    await ws.send_str(json.dumps({
+                        "jsonrpc": "2.0", "method": "session/update",
+                        "params": {"sessionId": params["sessionId"],
+                                   "update": u},
+                    }))
         return ws
 
 
@@ -282,3 +294,57 @@ def test_alias_map_shape():
     # every alias target should look like a devin_version value
     assert all(v.startswith("devin") for v in MODEL_ALIASES.values())
     assert len(set(MODEL_ALIASES.values())) >= 10  # distinct models, not one blob
+
+
+# ---- live session/update stream ------------------------------------------
+
+
+async def test_session_stream_load_and_forward(fake, creds_file):
+    """session/load on the persistent socket streams updates for a session
+    that was created elsewhere — the entire progress feature rests on this."""
+    srv, base = fake
+    srv.post_load_updates = [
+        {"sessionUpdate": "tool_call", "title": "Read x.py"},
+        {"sessionUpdate": "agent_thought_chunk"},
+    ]
+    seen: list[tuple[str, dict]] = []
+
+    async def on_update(sid: str, upd: dict) -> None:
+        seen.append((sid, upd))
+
+    bridge = make_bridge(creds_file, base)
+    stream = SessionStream(bridge, on_update=on_update)
+    await stream.attach("deadbeefcafe1234")
+    loads = [r for r in srv.requests if r["method"] == "session/load"]
+    assert loads[0]["params"]["sessionId"] == "devin-deadbeefcafe1234"
+    await asyncio.sleep(0.3)  # let the reader dispatch the pushed updates
+    assert seen[0] == ("deadbeefcafe1234",
+                       {"sessionUpdate": "tool_call", "title": "Read x.py"})
+    assert len(seen) == 2
+    assert "deadbeefcafe1234" in stream._attached
+
+    await stream.attach("deadbeefcafe1234")  # idempotent — no second load
+    assert [r for r in srv.requests
+            if r["method"] == "session/load"].__len__() == 1
+    await stream.aclose()
+
+
+async def test_session_stream_survives_socket_death(fake, creds_file):
+    srv, base = fake
+    bridge = make_bridge(creds_file, base)
+    stream = SessionStream(bridge, on_update=lambda s, u: asyncio.sleep(0))
+    await stream.attach("deadbeefcafe1234")
+    # socket dies mid-flight; the reader's finally must clear state so the
+    # next attach() re-opens and re-loads (no stale "already loaded" set)
+    assert stream._ws is not None
+    await stream._ws.close()
+    for _ in range(50):  # reader loop teardown is async — give it a beat
+        if stream._ws is None:
+            break
+        await asyncio.sleep(0.05)
+    assert stream._ws is None and not stream._attached
+    await stream.attach("deadbeefcafe1234")
+    assert "deadbeefcafe1234" in stream._attached
+    loads = [r for r in srv.requests if r["method"] == "session/load"]
+    assert len(loads) == 2  # re-opened socket re-loaded the session
+    await stream.aclose()
