@@ -30,7 +30,10 @@ CONFIG_OPTIONS = [
     {"id": "org_id", "name": "Organization", "type": "select",
      "currentValue": "org-x", "options": [{"name": "Org", "value": "org-x"}]},
     {"id": "repos", "name": "Repositories", "type": "select",
-     "currentValue": "", "options": [{"name": "harbour", "value": "Alby2007/the-harbour"}]},
+     "currentValue": "", "options": [
+         {"name": "harbour", "value": "Alby2007/the-harbour"},
+         {"name": "stockbot", "value": "Alby2007/Stockbot"},
+     ]},
     {"id": "devin_version", "name": "Devin version", "type": "select",
      "currentValue": "devin-2-5", "options": MODEL_OPTIONS},
 ]
@@ -44,6 +47,7 @@ class FakeBridgeServer:
         self.requests: list[dict[str, Any]] = []
         self.prompt_updates_before_response = True
         self.fail_on: dict[str, dict[str, Any]] = {}
+        self.blueprints: list[dict[str, Any]] = []
         self.server = TestServer(web.Application())
 
     async def start(self) -> str:
@@ -80,6 +84,11 @@ class FakeBridgeServer:
                           "configOptions": CONFIG_OPTIONS}
             elif method == "session/set_config_option":
                 result = {"configOptions": CONFIG_OPTIONS}
+            elif method == "_cognition.ai/snapshot-setup/list-blueprints":
+                result = {"blueprints": self.blueprints}
+            elif method == "_cognition.ai/snapshot-setup/create-blueprint":
+                self.blueprints.append({"repo_name": params.get("repo_name")})
+                result = {"blueprint_id": "bp-new"}
             elif method == "session/prompt":
                 if self.prompt_updates_before_response:
                     await ws.send_str(json.dumps({
@@ -160,15 +169,34 @@ async def test_happy_path(fake, creds_file):
     assert sess.model_label == "SWE-2 Max"
 
     methods = [r["method"] for r in srv.requests]
-    assert methods == ["initialize", "session/new", "session/set_config_option",
-                       "session/set_config_option", "session/prompt"]
+    assert methods == [
+        "initialize", "session/new",
+        "session/set_config_option",              # devin_version
+        "_cognition.ai/snapshot-setup/list-blueprints",
+        "_cognition.ai/snapshot-setup/create-blueprint",  # harbour has none
+        "session/set_config_option",              # repos
+        "session/prompt",
+    ]
     cfg = srv.requests[2]["params"]
     assert cfg["configId"] == "devin_version"
     assert cfg["value"] == "devin-swe-2-max"
-    assert srv.requests[3]["params"]["configId"] == "repos"
-    assert srv.requests[3]["params"]["value"] == "Alby2007/the-harbour"
-    prompt = srv.requests[4]["params"]["prompt"]
+    create_bp = srv.requests[4]["params"]
+    assert create_bp["repo_name"] == "Alby2007/the-harbour"
+    assert srv.requests[5]["params"]["configId"] == "repos"
+    assert srv.requests[5]["params"]["value"] == "Alby2007/the-harbour"
+    prompt = srv.requests[6]["params"]["prompt"]
     assert prompt == [{"type": "text", "text": "do the thing"}]
+
+
+async def test_blueprint_skipped_when_repo_has_one(fake, creds_file):
+    """A repo with an existing blueprint doesn't trigger create-blueprint."""
+    srv, base = fake
+    srv.blueprints.append({"repo_name": "Alby2007/the-harbour"})
+    b = make_bridge(creds_file, base)
+    await b.create_cloud_session("x", repos=["Alby2007/the-harbour"])
+    methods = [r["method"] for r in srv.requests]
+    assert "_cognition.ai/snapshot-setup/list-blueprints" in methods
+    assert "_cognition.ai/snapshot-setup/create-blueprint" not in methods
 
 
 async def test_prompt_returns_on_first_update(fake, creds_file):
@@ -180,6 +208,33 @@ async def test_prompt_returns_on_first_update(fake, creds_file):
     # but this proves the early-return path exists and works.
     sess = await b.create_cloud_session("hi", model=None)
     assert sess.session_id == "deadbeefcafe1234"
+
+
+async def test_repos_case_resolved_to_canonical(fake, creds_file):
+    """The bridge silently drops non-exact option values — the client must
+    canonicalize. `alby2007/stockbot` must hit the wire as `Alby2007/Stockbot`."""
+    srv, base = fake
+    b = make_bridge(creds_file, base)
+    await b.create_cloud_session("x", repos=["alby2007/stockbot"])
+    set_calls = [r for r in srv.requests if r["method"] == "session/set_config_option"]
+    assert len(set_calls) == 1
+    assert set_calls[0]["params"]["value"] == "Alby2007/Stockbot"
+
+
+async def test_repos_multi_and_substring(fake, creds_file):
+    srv, base = fake
+    b = make_bridge(creds_file, base)
+    await b.create_cloud_session("x", repos=["STOCKBOT", "harbour"])
+    set_calls = [r for r in srv.requests if r["method"] == "session/set_config_option"]
+    assert set_calls[0]["params"]["value"] == "Alby2007/Stockbot,Alby2007/the-harbour"
+
+
+async def test_unknown_repo_raises(fake, creds_file):
+    srv, base = fake
+    b = make_bridge(creds_file, base)
+    with pytest.raises(BridgeError, match="unknown repo"):
+        await b.create_cloud_session("x", repos=["nobody/nonexistent"])
+    assert "session/prompt" not in [r["method"] for r in srv.requests]
 
 
 async def test_unknown_model_raises(fake, creds_file):

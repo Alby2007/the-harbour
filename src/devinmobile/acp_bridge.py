@@ -144,6 +144,7 @@ class AcpBridge:
         self._session = session  # injectable for tests
         self._owned_session: aiohttp.ClientSession | None = None
         self._ids = itertools.count(1)
+        self._catalog_cache: dict[str, dict[str, Any]] | None = None
 
     # ---- credentials ----------------------------------------------------
 
@@ -254,7 +255,62 @@ class AcpBridge:
                 self._owned_session = None
                 await owned.close()
 
+    async def _ensure_blueprints(
+        self, ws: aiohttp.ClientWebSocketResponse, org_id: str, repos: list[str]
+    ) -> None:
+        """Ensure a snapshot blueprint exists for each repo.
+
+        The cloud VM clones repos via their blueprint's snapshot; a repo with
+        no blueprint silently isn't cloned even when the `repos` config option
+        is set. Best-effort: blueprint failures log and continue — the repo
+        attach still happens server-side.
+        """
+        try:
+            existing = await self._rpc(
+                ws,
+                "_cognition.ai/snapshot-setup/list-blueprints",
+                {"org_id": org_id},
+            )
+            have = {
+                b.get("repo_name")
+                for b in existing.get("blueprints", [])
+                if b.get("repo_name")
+            }
+            for repo in repos:
+                if repo in have:
+                    continue
+                created = await self._rpc(
+                    ws,
+                    "_cognition.ai/snapshot-setup/create-blueprint",
+                    {"org_id": org_id, "repo_name": repo},
+                )
+                if created.get("blueprint_id"):
+                    log.info("created env blueprint for %s", repo)
+        except BridgeError as e:
+            log.warning("blueprint ensure failed (repo attach may not clone): %s", e)
+
     # ---- public API ------------------------------------------------------
+
+    async def catalog(self) -> dict[str, dict[str, Any]]:
+        """Return the session/new configOptions catalog, cached for the
+        process lifetime.
+
+        Spawns an unprompted draft purely to read the options — drafts are
+        invisible to v3 and cost nothing. Powers Discord autocomplete for
+        repos; the result feeds ``resolve_option`` so users can't send a
+        value the bridge would silently drop.
+        """
+        if self._catalog_cache is not None:
+            return self._catalog_cache
+        ws = await self._connect()
+        try:
+            new = await self._rpc(ws, "session/new", {"cwd": "/", "mcpServers": []})
+        finally:
+            await self._close(ws)
+        self._catalog_cache = {
+            o.get("id", ""): o for o in new.get("configOptions", []) if o.get("id")
+        }
+        return self._catalog_cache
 
     async def create_cloud_session(
         self,
@@ -303,13 +359,30 @@ class AcpBridge:
                     },
                 )
             if repos and "repos" in options:
+                repo_opts = [
+                    ConfigOption(name=o.get("name", ""), value=o.get("value", ""))
+                    for o in (options["repos"].get("options") or [])
+                ]
+                # The bridge silently drops values that aren't exact option
+                # values — resolve case-insensitively to the canonical names.
+                resolved_repos = (
+                    [resolve_option(r, repo_opts, what="repo").value for r in repos]
+                    if repo_opts
+                    else list(repos)
+                )
+                # A repo only gets cloned into the workspace if it has an env
+                # blueprint — without one the session silently falls back to
+                # the default repo. Mirror the CLI's ensure_blueprint_exists.
+                org_id = options.get("org_id", {}).get("currentValue") or ""
+                if org_id:
+                    await self._ensure_blueprints(ws, org_id, resolved_repos)
                 await self._rpc(
                     ws,
                     "session/set_config_option",
                     {
                         "sessionId": session_id,
                         "configId": "repos",
-                        "value": ",".join(repos),
+                        "value": ",".join(resolved_repos),
                     },
                 )
             if platform and "platform" in options:

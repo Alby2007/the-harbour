@@ -12,7 +12,7 @@ Creates a session and its thread.
 | --- | --- | --- |
 | `prompt` | required | The task, verbatim — it's the first user message to Devin |
 | `model` | optional, autocomplete | Real model picker: `swe2-max`, `opus`, `ultra`, `fusion`, `lite`, `gpt-6.1`, … Free text is fuzzy-matched against the server's live catalog; unknown values error back with the valid list |
-| `repo` | optional | `owner/repo`, comma-separate for several |
+| `repo` | optional, autocomplete | Suggests your connected `owner/repo`s (comma-separated multi-select works — autocomplete applies to the last token). Free text is fuzzy-matched and canonicalized; unknown repos error back with the valid list |
 | `mode` | optional | v3 `devin_mode` tier — `lite`/`normal`/`fast`/`ultra`/`fusion`. Ignored when `model:` is set (the model select supersedes it). Beats `DEVIN_DEFAULT_MODEL` when passed explicitly |
 
 `DEVIN_DEFAULT_MODEL` (env) applies a model to every `/devin` call that passes

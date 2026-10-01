@@ -31,6 +31,33 @@ async def model_autocomplete(
     ][:25]
 
 
+async def repo_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest canonical `owner/repo` values from the bridge's live catalog.
+
+    Autocompletes the token after the last comma so multi-repo input works.
+    Falls back to no suggestions (free text) when the bridge is unreachable —
+    the bridge itself still canonicalizes/validates whatever is typed.
+    """
+    bridge = getattr(interaction.client, "bridge", None)
+    if bridge is None or not bridge.available:
+        return []
+    try:
+        options = (await bridge.catalog()).get("repos", {}).get("options") or []
+    except Exception:  # noqa: BLE001 — autocomplete must never fail the command
+        return []
+    head, sep, tail = current.rpartition(",")
+    cur = tail.strip().lower()
+    prefix = head + sep if sep else ""
+    out: list[app_commands.Choice[str]] = []
+    for o in options:
+        value, name = o.get("value", ""), o.get("name", "")
+        if value and (not cur or cur in value.lower() or cur in name.lower()):
+            out.append(app_commands.Choice(name=value, value=prefix + value))
+    return out[:25]
+
+
 def register_commands(bot: "DevinMobileBot") -> None:
     tree = bot.tree
 
@@ -66,7 +93,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         title="Thread/session title",
     )
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in DEVIN_MODES])
-    @app_commands.autocomplete(model=model_autocomplete)
+    @app_commands.autocomplete(model=model_autocomplete, repo=repo_autocomplete)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def devin_cmd(
         interaction: discord.Interaction,

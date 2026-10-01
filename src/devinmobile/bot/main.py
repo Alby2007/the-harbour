@@ -47,6 +47,16 @@ class DevinMobileBot(discord.Client):
                 "until `devin auth login` runs on this host",
                 self.settings.devin_credentials_path,
             )
+        else:
+            # Warm the repo/model catalog so slash-command autocomplete is
+            # instant — the first keystroke shouldn't pay a WS round-trip.
+            async def _warm_catalog() -> None:
+                try:
+                    await self.bridge.catalog()
+                except Exception:
+                    log.warning("bridge catalog prefetch failed", exc_info=True)
+
+            asyncio.create_task(_warm_catalog())
         self.relay = Relay(self, self.devin, self.db, self.settings)
         register_commands(self)
         if self.settings.command_guild_id:

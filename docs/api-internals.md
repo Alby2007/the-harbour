@@ -86,6 +86,20 @@ variants · `devin-opus-5-5` Opus 5.5 · `devin-gpt-6-sol`,
 {"id":3,"method":"session/set_config_option","params":{
   "sessionId":"devin-...","configId":"devin_version","value":"devin-swe-2-max"}}
 // <- result.configOptions (full updated list; currentValue reflects the set)
+//
+// ⚠ set_config_option values are validated against the option list and
+//   non-matching values are SILENTLY DROPPED (currentValue returns '').
+//   No error. Always send the canonical `value` — resolve user input
+//   case-insensitively against options first (resolve_option does this).
+//
+// ⚠ `repos` requires a snapshot blueprint for the repo or the workspace
+//   won't clone it (the option registers on sessionRepos metadata, but the
+//   VM falls back to the default repo). Mirror the CLI: ensure a blueprint
+//   exists before prompting —
+{"id":4,"method":"_cognition.ai/snapshot-setup/list-blueprints",
+ "params":{"org_id":"org-..."}}
+{"id":5,"method":"_cognition.ai/snapshot-setup/create-blueprint",
+ "params":{"org_id":"org-...","repo_name":"Alby2007/Stockbot"}}   // if missing
 
 // -> session/prompt   ⚠ response arrives at TURN END (minutes) — don't wait
 {"id":4,"method":"session/prompt","params":{

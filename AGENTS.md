@@ -71,5 +71,13 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   returns on the first update notification. `session_id` comes back
   `devin-`-prefixed; v3 uses the bare hex (strip it). `repos` config values
   are `owner/repo` strings (multi = comma-joined, observed single only).
+  Two traps: non-option values are silently dropped (`currentValue` echoes
+  `''`), so `resolve_option` canonicalizes case/substrings first; and a repo
+  without a snapshot blueprint is NOT cloned (only `creationRepos` metadata
+  updates — the VM falls back to the default repo). `AcpBridge.
+  _ensure_blueprints` mirrors the CLI's ensure-blueprint step via
+  `_cognition.ai/snapshot-setup/{list,create}-blueprints` before setting
+  `repos`. `AcpBridge.catalog()` caches the configOptions for repo
+  autocomplete.
   The bridge token is user-scoped OAuth — sessions made through it belong to
   that user and are NOT visible to the service key until first prompt.
