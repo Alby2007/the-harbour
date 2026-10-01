@@ -11,14 +11,61 @@ from devinmobile.progress import (
 
 
 def test_summarize_update():
-    assert summarize_update({"sessionUpdate": "tool_call",
-                             "title": "Read /x.py"}) == "`Read /x.py`"
-    assert summarize_update({"sessionUpdate": "tool_call"}) is not None
+    lines = summarize_update({"sessionUpdate": "tool_call",
+                              "title": "Read /x.py", "toolCallId": "t1"})
+    assert [li.text for li in lines] == ["`Read /x.py`"]
+    assert lines[0].key == "t1"
+    # no title/id at all still renders a placeholder line for a NEW call
+    assert summarize_update({"sessionUpdate": "tool_call"})
     # chat/thought chunks are the v3 relay's job — don't double-display
-    assert summarize_update({"sessionUpdate": "agent_message_chunk"}) is None
-    assert summarize_update({"sessionUpdate": "session_info_update"}) is None
+    assert summarize_update({"sessionUpdate": "agent_message_chunk"}) == []
+    assert summarize_update({"sessionUpdate": "session_info_update"}) == []
+    # a bare status flip with no title/id is noise, not a line
     assert summarize_update({"sessionUpdate": "tool_call_update",
-                             "status": "failed"}) == "a step failed — retrying"
+                             "status": "completed"}) == []
+
+
+def test_summarize_execute_renders_shell_prompt():
+    lines = summarize_update({
+        "sessionUpdate": "tool_call", "toolCallId": "c1",
+        "kind": "execute", "rawInput": {"command": "pytest -x"},
+    })
+    assert lines[0].text == "$ `pytest -x`"
+    # title-only fallback drops Devin's "Run " verb
+    lines = summarize_update({
+        "sessionUpdate": "tool_call", "kind": "execute",
+        "title": "Run pytest -x",
+    })
+    assert lines[0].text == "$ `pytest -x`"
+
+
+def test_summarize_status_marks():
+    done = summarize_update({"sessionUpdate": "tool_call_update",
+                             "toolCallId": "c1", "title": "pytest",
+                             "status": "completed"})
+    assert done[0].text == "`pytest` ✓"
+    failed = summarize_update({"sessionUpdate": "tool_call_update",
+                               "toolCallId": "c1", "title": "pytest",
+                               "status": "failed",
+                               "rawOutput": "ok\n\n5 failed, 2 passed"})
+    assert failed[0].text == "`pytest` ✗"
+    assert failed[1].text == "↳ `5 failed, 2 passed`"
+    assert failed[1].key == "c1:out"
+
+
+def test_failure_tail_from_content_blocks_and_ansi():
+    upd = {"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+           "title": "pytest", "status": "failed",
+           "content": [{"type": "content",
+                        "content": {"type": "text",
+                                    "text": "\x1b[31mFAILED a.py::t\x1b[0m"}}]}
+    lines = summarize_update(upd)
+    assert lines[1].text == "↳ `FAILED a.py::t`"
+    # no output anywhere → just the ✗ line
+    no_out = summarize_update({"sessionUpdate": "tool_call_update",
+                               "toolCallId": "c1", "title": "pytest",
+                               "status": "failed"})
+    assert [li.text for li in no_out] == ["`pytest` ✗"]
 
 
 class _Msg:
@@ -80,7 +127,27 @@ async def test_consecutive_dupe_lines_dropped():
     await tracker.push(b, "`x`")
     await tracker.push(b, "`x`")
     st = tracker._streams["s2"]
-    assert list(st.lines) == ["`x`"]
+    assert [li.text for li in st.lines] == ["`x`"]
+
+
+async def test_tool_update_patches_line_in_place():
+    """toolCallId-keyed upserts: a completed status rewrites the existing
+    line (adds ✓) rather than stacking a second line."""
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="s5", thread_id=1, channel_id=1)
+    from devinmobile.progress import _Line
+    await tracker.push(b, _Line(text="$ `pytest -x`", key="c1"))
+    await tracker.push(b, _Line(text="$ `pytest -x` ✓", key="c1"))
+    st = tracker._streams["s5"]
+    assert [li.text for li in st.lines] == ["$ `pytest -x` ✓"]
+    # a different call appends normally
+    await tracker.push(b, _Line(text="`Read x.py`", key="c2"))
+    assert len(st.lines) == 2
+    # patching an evicted/unknown key just appends
+    await tracker.push(b, _Line(text="`grep foo`", key="c9"))
+    assert len(st.lines) == 3
+    await tracker.done(b)  # cancels the deferred flush task
 
 
 async def test_thinking_placeholder_morphs_and_clears():

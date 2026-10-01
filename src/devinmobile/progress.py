@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -31,23 +32,92 @@ MAX_LINES = 6
 GetThread = Callable[["Binding"], Awaitable["discord.Thread | None"]]
 
 
-def summarize_update(update: dict[str, Any]) -> str | None:
-    """Map a session/update payload to one short line, or None to skip.
+@dataclass
+class _Line:
+    """One rendered row in the Working message. ``key`` is the ACP
+    ``toolCallId`` — later updates for the same call patch this line in
+    place instead of appending a new one."""
+    text: str
+    key: str = ""
 
-    ``tool_call`` carries a human-readable ``title`` ("Read /path/x.py",
-    "Run `pytest`") — that's the progress signal. Thought/message chunks
-    duplicate what the v3 relay already posts and would double-display.
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _tool_text(update: dict[str, Any]) -> str:
+    """The tool call's base label — empty string when nothing is
+    renderable. ``kind == "execute"`` gets ``$ cmd`` shell styling."""
+    title = (update.get("title") or "").strip()
+    raw = update.get("rawInput") or {}
+    if not title:
+        title = str(raw.get("command") or raw.get("path") or "")
+    if not title:
+        locs = update.get("locations") or []
+        if locs and isinstance(locs[0], dict):
+            title = str(locs[0].get("path") or "")
+    if not title:
+        return ""
+    if update.get("kind") == "execute":
+        cmd = str(raw.get("command") or title)
+        cmd = cmd.removeprefix("Run ").removeprefix("run ")
+        return f"$ `{cmd[:110]}`"
+    return f"`{title[:110]}`"
+
+
+def _failure_tail(update: dict[str, Any]) -> str | None:
+    """Last meaningful output line of a failed call — 'what did it say' is
+    the first question a phone user asks after seeing ✗."""
+    text = ""
+    for block in update.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        inner = block.get("content")
+        if isinstance(inner, dict) and inner.get("type") == "text":
+            text = str(inner.get("text") or "")
+        elif block.get("type") == "terminal":
+            text = str(block.get("text") or block.get("output") or text)
+    raw_out = update.get("rawOutput")
+    if isinstance(raw_out, str) and raw_out:
+        text = raw_out
+    elif isinstance(raw_out, dict):
+        for k in ("output", "text", "stderr", "error", "message"):
+            if raw_out.get(k):
+                text = str(raw_out[k])
+    for ln in reversed(_ANSI.sub("", text).splitlines()):
+        if ln.strip():
+            return f"↳ `{ln.strip()[:140]}`"
+    return None
+
+
+def summarize_update(update: dict[str, Any]) -> list[_Line]:
+    """Map a session/update payload to Working-message lines ([] = skip).
+
+    ACP upserts tool calls by ``toolCallId`` — we surface that as a _Line
+    key so ``push`` patches the status onto the same line. Thought/message
+    chunks duplicate the v3 relay and stay skipped.
     """
     kind = update.get("sessionUpdate")
-    if kind == "tool_call":
-        title = (update.get("title") or "").strip()
-        if not title:
-            raw = update.get("rawInput") or {}
-            title = str(raw.get("command") or raw.get("path") or "working")
-        return f"`{title[:110]}`"
-    if kind == "tool_call_update" and update.get("status") == "failed":
-        return "a step failed — retrying"
-    return None
+    if kind not in ("tool_call", "tool_call_update"):
+        return []
+    call_id = str(update.get("toolCallId") or "")
+    status = update.get("status") or ""
+    base = _tool_text(update)
+    if not base:
+        if kind == "tool_call_update":
+            return []  # bare status flip on an unseen call — nothing to say
+        base = "`working`"
+    if status == "completed":
+        base += " ✓"
+    elif status == "failed":
+        base += " ✗"
+    lines = [_Line(text=base, key=call_id)]
+    if status == "failed":
+        tail = _failure_tail(update)
+        if tail:
+            lines.append(
+                _Line(text=tail, key=f"{call_id}:out" if call_id else "")
+            )
+    return lines
 
 
 def chunk_text_from(update: dict[str, Any]) -> str:
@@ -78,7 +148,9 @@ THINKING_TEXT = "⏳ *Devin is thinking…*"
 @dataclass
 class _Stream:
     msg_id: int | None = None
-    lines: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_LINES))
+    lines: deque[_Line] = field(
+        default_factory=lambda: deque(maxlen=MAX_LINES)
+    )
     last_edit: float = 0.0
     flush_task: asyncio.Task | None = None
     dirty: bool = False
@@ -126,7 +198,9 @@ class ProgressTracker:
         if st is not None and not st.lines:
             await self.done(binding)
 
-    async def push(self, binding: Binding, line: str) -> None:
+    async def push(self, binding: Binding, line: _Line | str) -> None:
+        if isinstance(line, str):
+            line = _Line(text=line)
         st = self._streams.setdefault(binding.session_id, _Stream())
         # a tool call after reply text means a new message is coming —
         # seal the current reply so the next chunk opens a fresh one
@@ -134,7 +208,23 @@ class ProgressTracker:
         if segs and segs[-1].buf and not segs[-1].sealed:
             segs[-1].sealed = True
             await self._flush_reply(binding, segs[-1])
-        if st.lines and st.lines[-1] == line:
+        # ACP upserts by toolCallId: a status update rewrites its line
+        # (adds ✓/✗) instead of stacking a new one
+        if line.key:
+            for existing in st.lines:
+                if existing.key == line.key:
+                    if existing.text == line.text:
+                        return
+                    existing.text = line.text
+                    st.dirty = True
+                    if time.time() - st.last_edit >= MIN_EDIT_INTERVAL:
+                        await self._flush(binding, st)
+                    elif st.flush_task is None or st.flush_task.done():
+                        st.flush_task = asyncio.create_task(
+                            self._flush_later(binding, st)
+                        )
+                    return
+        if st.lines and st.lines[-1].text == line.text:
             return  # consecutive dupes (retried reads etc.) add nothing
         was_idle = not st.lines
         st.lines.append(line)
@@ -162,7 +252,9 @@ class ProgressTracker:
         if thread is None:
             return
         text = (
-            "**Working…**\n" + "\n".join(st.lines) if st.lines else THINKING_TEXT
+            "**Working…**\n" + "\n".join(li.text for li in st.lines)
+            if st.lines
+            else THINKING_TEXT
         )
         try:
             if st.msg_id is None:

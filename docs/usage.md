@@ -115,8 +115,10 @@ Refreshes a session's status embed on demand (defaults to the most recent).
   each. Unreadable links are noted so Devin knows to try its own browser.
 - **Liveness**: the bot shows "typing…" while the session is mid-turn, and
   (when the bridge is available) a single **"Working…"** message tracks the
-  live tool calls — `Read /path/x.py`, `Run pytest -x` — edited in place
-  every ~3s and deleted when the turn ends. The transcript stays clean;
+  live tool calls — `` `Read /path/x.py` ``, `` `$ pytest -x` `` (shell
+  commands get prompt styling) — edited in place every ~3s. Each call's
+  line gains `✓`/`✗` as it finishes, and failures append a
+  `↳ last output line` tail. The message is deleted when the turn ends;
   set `ACP_PROGRESS=0` to disable.
 - **Voice steering**: with `OPENAI_API_KEY` set, a voice message in a bound
   thread is transcribed (Whisper) and sent to the session as text — the

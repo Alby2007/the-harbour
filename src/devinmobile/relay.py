@@ -272,13 +272,14 @@ class Relay:
                 if binding is not None:
                     await self.progress.stream_chunk(binding, text)
             return
-        line = summarize_update(update)
-        if line is None:
+        lines = summarize_update(update)
+        if not lines:
             return
         binding = await self.db.get_binding(session_id)
         if binding is None:
             return
-        await self.progress.push(binding, line)
+        for line in lines:
+            await self.progress.push(binding, line)
 
     # ---- budget + liveness ------------------------------------------------
 

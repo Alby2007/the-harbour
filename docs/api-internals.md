@@ -113,7 +113,10 @@ variants · `devin-opus-5-5` Opus 5.5 · `devin-gpt-6-sol`,
 // <- meanwhile: {"method":"session/update","params":{"sessionId":...,
 //    "update":{...}}} notifications stream progress (also user_message echo,
 //    availableCommands, token usage, status/lifecycle meta under
-//    cognition.ai/* keys)
+//    cognition.ai/* keys). tool_call/tool_call_update are upserts keyed by
+//    toolCallId — kind (execute/read/edit/…), status
+//    (pending/in_progress/completed/failed), title, rawInput{command,path},
+//    content[], locations[]; updates patch the call, not append
 // <- result.stopReason "end_turn" + _meta {url, sessionStatus, orgId, ...}
 ```
 
