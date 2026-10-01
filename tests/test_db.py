@@ -130,3 +130,35 @@ async def test_pr_auto_merge_flag_survives_state_upserts(tmp_path):
     row = await db.get_pr("s1", "https://github.com/o/r/pull/1")
     assert row.auto_merge is True
     await db.close()
+
+
+async def test_repo_notes_roundtrip_and_dedupe(tmp_path):
+    db = await Database.connect(str(tmp_path / "t.db"))
+    assert await db.add_note("o/r", "tests are flaky — pytest -x", "u1")
+    # UNIQUE(repo, note): the same pair can't be saved twice
+    assert await db.add_note("o/r", "tests are flaky — pytest -x", "u2") is False
+    assert await db.add_note("o/r", "different note", "u1")
+    await db.add_note("O/Other", "case probe", None)
+    # case-insensitive repo match, newest first
+    got = await db.notes_for_repos(["O/R"])
+    assert got == {"o/r": ["different note", "tests are flaky — pytest -x"]}
+    got = await db.notes_for_repos(["o/other"])
+    assert got == {"O/Other": ["case probe"]}
+    assert await db.notes_for_repos([]) == {}
+    # list + delete
+    rows = await db.list_notes()
+    assert len(rows) == 3
+    rows = await db.list_notes("o/R")
+    assert len(rows) == 2
+    nid = rows[0][0]
+    assert await db.delete_note(nid)
+    assert not await db.delete_note(nid)
+
+
+async def test_repo_notes_eight_per_repo_cap(tmp_path):
+    db = await Database.connect(str(tmp_path / "t.db"))
+    for i in range(10):
+        await db.add_note("o/r", f"note {i}", None)
+    got = await db.notes_for_repos(["o/r"])
+    assert len(got["o/r"]) == 8
+    assert got["o/r"][0] == "note 9"  # newest first

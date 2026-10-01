@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 
 from ..acp_bridge import MODEL_ALIASES
+from ..chains import PLAYBOOKS, continued_chain, render_prompt
 from ..db import Binding, ScheduleRow
 from ..embeds import status_embed
 from ..github_client import parse_issue_ref
@@ -219,6 +220,153 @@ def register_commands(bot: "DevinMobileBot") -> None:
         await interaction.followup.send(f"Session started → {thread.mention}")
 
     @tree.command(
+        name="chain",
+        description="Run a playbook — chained Devin phases, one session each",
+    )
+    @app_commands.describe(
+        playbook="janitor: audit→fix→review→merge · iterate: implement→review→apply→merge",
+        prompt="The task/instructions for the first phase",
+        repo="org/repo (comma-separate for several)",
+        budget="Chain-wide ACU cap (default: MAX_ACU_LIMIT × phases)",
+        auto="Run every phase without tapping Continue (default: ask at mutating phases)",
+        title="Thread title prefix",
+    )
+    @app_commands.choices(
+        playbook=[app_commands.Choice(name=k, value=k) for k in PLAYBOOKS]
+    )
+    @app_commands.autocomplete(repo=repo_autocomplete)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def chain_cmd(
+        interaction: discord.Interaction,
+        playbook: str,
+        prompt: str,
+        repo: str | None = None,
+        budget: float | None = None,
+        auto: bool = False,
+        title: str | None = None,
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if budget is not None and budget <= 0:
+            await interaction.response.send_message(
+                "`budget:` must be a positive number of ACUs.", ephemeral=True
+            )
+            return
+        phases = PLAYBOOKS.get(playbook)
+        if not phases:
+            await interaction.response.send_message(
+                f"Unknown playbook {playbook!r} — choices: "
+                + ", ".join(PLAYBOOKS),
+                ephemeral=True,
+            )
+            return
+        if not bot.settings.github_enabled and any(
+            p.gate == "single_pr" or p.action == "arm_automerge"
+            for p in phases
+        ):
+            # without the App the prs table never fills, so a PR gate
+            # can't see what Devin opened and auto-merge can't arm —
+            # the chain would halt at review with "no single PR produced"
+            await interaction.response.send_message(
+                f"`{playbook}` needs the GitHub App (GITHUB_APP_*) — its "
+                "PR gate and auto-merge phases can't work without it.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        repos = _split_repos(repo)
+        cap = (
+            float(budget)
+            if budget
+            else (
+                float(bot.settings.max_acu_limit) * len(phases)
+                if bot.settings.max_acu_limit
+                else None
+            )
+        )
+        base_title = title or f"{playbook}: {prompt[:60]}"
+        chain = {
+            "playbook": playbook,
+            "step": 0,
+            "pending": None,
+            "cap": cap,
+            "spent": 0.0,
+            "pr_key": "",
+            "orig": prompt,
+            "auto": bool(auto),
+            # stable base for phase thread titles ("<base> · <phase>")
+            "title": base_title,
+        }
+        prompt0 = render_prompt(
+            phases[0], {"orig": prompt, "repo": ",".join(repos or [])}
+        )
+        try:
+            session, thread = await spawn_session(
+                bot,
+                prompt=prompt0,
+                repos=repos,
+                title=base_title,
+                budget=cap,
+                chain=chain,
+            )
+        except SpawnError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"Chain `{playbook}` started → {thread.mention}"
+        )
+        await thread.send(
+            f"⛓️ chain **{playbook}** — "
+            + " → ".join(f"`{p.name}`" for p in phases)
+            + (
+                ""
+                if auto
+                else " — mutating phases wait for a **Continue →** tap"
+            )
+        )
+
+    @tree.command(name="chains", description="List playbook chains")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def chains_cmd(interaction: discord.Interaction) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        rows = await bot.db.chained_bindings()
+        if not rows:
+            await interaction.response.send_message(
+                "No chains yet.", ephemeral=True
+            )
+            return
+        embed = discord.Embed(title="Playbook chains")
+        for b in rows:
+            c = b.chain or {}
+            phases = PLAYBOOKS.get(str(c.get("playbook") or ""), [])
+            step = int(c.get("step") or 0)
+            pend = c.get("pending")
+            shown = int(pend) if pend is not None else step
+            phase_name = phases[shown].name if shown < len(phases) else "done"
+            bits = [
+                f"`{c.get('playbook')}` step "
+                f"{min(step + 1, len(phases))}/{len(phases)} `{phase_name}`"
+            ]
+            if pend is not None:
+                # pending holds the NEXT phase's index — name it, not the
+                # completed one
+                bits.append("⏸ awaiting Continue tap")
+            if c.get("halted"):
+                bits.append(f"🏁 {c['halted']}")
+            if c.get("spent"):
+                bits.append(f"{c['spent']:g} ACU")
+            bits.append(f"<#{b.thread_id}>")
+            embed.add_field(
+                name=(b.title or b.session_id)[:100],
+                value=" · ".join(bits),
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(
         name="devin-all", description="Start one session per repo (fan-out)"
     )
     @app_commands.describe(
@@ -372,6 +520,9 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 title=f"{binding.title or 'session'} (cont.)",
                 continued_from=binding.session_id,
                 budget=binding.max_acu,
+                # a chain phase's /continue child IS the phase retry —
+                # carried chain state keeps the playbook advancing
+                chain=continued_chain(binding.chain, sess),
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)
@@ -419,6 +570,89 @@ def register_commands(bot: "DevinMobileBot") -> None:
         else:
             await interaction.response.send_message(
                 f"No schedule #{schedule_id}.", ephemeral=True
+            )
+
+    @tree.command(
+        name="note",
+        description="Save a standing note — injected into every future "
+        "session's prompt for that repo",
+    )
+    @app_commands.describe(
+        text="The guidance (e.g. 'tests are flaky — run pytest -x')",
+        repo="owner/repo (default: this thread's session repo)",
+    )
+    @app_commands.autocomplete(repo=repo_autocomplete)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def note_cmd(
+        interaction: discord.Interaction, text: str, repo: str | None = None
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        target = (repo or "").strip()
+        if not target and isinstance(interaction.channel, discord.Thread):
+            # phone flow: /note inside a session thread keys on its repo
+            binding = await bot.db.get_binding_by_thread(
+                interaction.channel.id
+            )
+            if binding is not None and binding.repos:
+                target = binding.repos.split(",")[0]
+        if not target:
+            await interaction.response.send_message(
+                "Pass `repo:` (or run inside a session thread).",
+                ephemeral=True,
+            )
+            return
+        if await bot.db.add_note(
+            target, text.strip(), str(interaction.user.id)
+        ):
+            await interaction.response.send_message(
+                f"Noted for `{target}` — future sessions will see it.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "That note already exists for this repo.", ephemeral=True
+            )
+
+    @tree.command(name="notes", description="List standing repo notes")
+    @app_commands.describe(repo="Filter to one repo (default: all repos)")
+    @app_commands.autocomplete(repo=repo_autocomplete)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def notes_cmd(
+        interaction: discord.Interaction, repo: str | None = None
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        rows = await bot.db.list_notes(repo)
+        if not rows:
+            await interaction.response.send_message(
+                "No notes yet.", ephemeral=True
+            )
+            return
+        embed = discord.Embed(title="Repo notes")
+        for nid, r, note in rows:
+            embed.add_field(name=f"#{nid} · {r}", value=note[:200],
+                            inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(name="unnote", description="Delete a repo note")
+    @app_commands.describe(note_id="Note id from /notes")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def unnote_cmd(
+        interaction: discord.Interaction, note_id: int
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if await bot.db.delete_note(note_id):
+            await interaction.response.send_message(
+                f"Deleted note #{note_id}.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"No note #{note_id}.", ephemeral=True
             )
 
     @tree.command(name="sessions", description="List sessions started through this bot")

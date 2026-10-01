@@ -63,6 +63,92 @@ touched, repo(s), model, and budget — plus your `notes:` if given. The old
 thread links to the new one. Sessions still `running` are refused — reply
 to steer instead.
 
+### `/chain`
+
+Runs a **playbook**: a named, ordered workflow where each phase is its own
+Devin session (a `continued_from` child seeded with the previous phase's
+structured output) or a bot-side action. One thread per phase; each
+completion card links to the next.
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `playbook` | required, choice | `janitor` or `iterate` — see below |
+| `prompt` | required | The task; becomes phase 0's prompt (`{orig}` for later phases) |
+| `repo` | optional, autocomplete | Same semantics as `/devin` — inherited by every phase |
+| `budget` | optional | **Chain-wide** ACU cap rolled across all phases (default: `MAX_ACU_LIMIT` × phase count) |
+| `auto` | optional | `yes` runs every phase without asking; default pauses before mutating phases |
+| `title` | optional | Thread title prefix (`title · phase-name`) |
+
+**Playbooks**
+
+- **`janitor`** — `audit → fix → review → automerge`. Audit sweeps the repo
+  for dead code / vulnerable deps / failing tests / coverage gaps and
+  reports findings (no fixes). If it reports `proceed=false` ("repo is
+  clean"), the chain halts there. Fix is human-gated — a **Continue → fix**
+  button on the audit's completion card spawns it. Review runs only when
+  fix produced exactly one PR, then `automerge` arms that PR's Auto-merge
+  flag bot-side (no session) so it merges itself when CI greens.
+- **`iterate`** — `implement → review → automerge` … plus an `apply` phase:
+  implement opens a PR, review examines the diff, then **Continue → apply**
+  spawns a fixer that pushes review fixes to the same PR (skipped entirely
+  if the review reports `proceed=false` — "PR is clean"), then auto-merge
+  arms.
+
+**Gates.** Each phase transition checks (in order): the next phase exists;
+its gate passes against the just-finished session (`proceed` reads the
+session's `structured_output.proceed` — an explicit `false` SKIPS that
+phase and re-evaluates the next, so a clean iterate review still reaches
+automerge; `single_pr` requires exactly one tracked PR); and the chain's
+ACU cap hasn't been spent. A failed gate or running off the end posts
+`⛓️ chain <name> done — <reason>` and the chain ends there.
+
+Both playbooks need the GitHub App — without it the PR gate can't see
+what Devin opened, so `/chain` refuses to start when GITHUB_APP_* isn't
+configured.
+
+**Human gates.** A non-auto phase posts a `Continue → <phase>` button on
+the completion card. Tapping it force-advances the chain and swaps the
+button out. The button is stateless — it survives bot restarts; if the
+chain already moved on, the tap answers ephemerally instead of double-
+spawning.
+
+**Restart safety.** Chain state lives on each phase's `bindings.chain` JSON
+(no separate table): `playbook`, `step`, `pending`, `cap`, `spent`,
+`pr_key`, `orig`, `auto`. On startup a resume sweep re-runs the advance for
+any exited chain phase that has no continuation child yet — `child_of`
+dedupes a spawn that landed right before a crash. `/kill` on a phase's
+thread parks that binding; the chain halts with it (a parked session can't
+complete, so nothing advances).
+
+If a phase's session *errors*, the chain halts with a notice — auto-respawn
+only covers phase 0 (continuation depth caps at 1). `/continue` in that
+thread retries the phase with the chain intact: it clears `pending`/`halted`
+and rolls the dead session's ACUs into `spent` so the budget still holds.
+
+### `/chains`
+
+Ephemeral list of the last 25 chain bindings: playbook, `step/total` +
+phase name, ⏸ marker while a Continue→ is pending, cumulative ACU spend,
+and a link to each phase's thread.
+
+### `/note` `/notes` `/unnote <id>`
+
+Repo memory — standing notes that get injected into every future session's
+prompt for that repo (spawn-time, so `/devin`, `/schedule`, `/chain` phases,
+respawns, and label-triggered spawns all see them):
+
+- `/note text:<note> [repo:]` — save guidance like "tests are flaky — run
+  `pytest -x`" or "use pnpm, not npm". Inside a session thread `repo:`
+  defaults to that session's repo; elsewhere it's required.
+- `/notes [repo:]` — ephemeral list (`#id · repo · text`, newest 20).
+- `/unnote id:N` — delete by id, same as `/unschedule`.
+
+Caps: 8 notes per repo (newest win), ~2k chars per injected block. The
+write-back half is automatic — when a session completes with
+`structured_output.repo_notes` populated, those entries save as
+`devin:<session>` notes (deduped on `(repo, note)`) and the thread gets a
+`📝 Saved N repo notes` line. So each session can teach the next.
+
 ### `/schedules` / `/unschedule <id>`
 
 List recurring tasks (next run, interval, state) / delete one.
@@ -100,6 +186,13 @@ Refreshes a session's status embed on demand (defaults to the most recent).
 - **Reply-quoting**: reply to a Devin message → its text is prepended as
   `re: "…"` so "yes" / "that one" carry context. Works on embeds too
   (anchor and PR cards resolve to their title/link).
+- **Choice buttons**: when a relayed Devin message is a question with an
+  enumerated option list (`1.`/`2.`/…, `A)`/`B)`/…, or bullets), the
+  message gets one button per option — a tap sends that choice to the
+  session verbatim, removes the buttons, and annotates the message with
+  `*(answered: …)*`. Confirmation questions ("should I proceed?", "want
+  me to continue?") get plain **Yes**/**No** buttons. Ambiguous or
+  oversized lists get no buttons — answering by typing always works.
 - **Emoji commands** (in a bound thread): 👍 on the anchor = approve the
   pending step; 👍 on a PR card = GitHub approve; 🔁 on the anchor = poll
   now; 🔁 on a PR card = refresh its state; 🔁 on a ❌-marked message =

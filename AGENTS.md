@@ -28,6 +28,8 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
 - `bot/commands.py` — `/devin` (create session → create public thread in
   HUB_CHANNEL_ID → anchor embed + view → insert binding), `/sessions`,
   `/devin-status`. `/devin model:X` switches creation to the ACP bridge.
+  `/chain playbook:…` spawns phase 0 with `chain={playbook, step:0, cap,
+  spent:0, orig, auto}`; `/chains` lists chain bindings ephemerally.
 - `acp_bridge.py` — model selection. v3's create schema has no `model` field
   (extra fields are silently ignored, not 422'd — verified), so `/devin
   model:X` creates the session over the internal ACP bridge the CLI/Desktop
@@ -50,7 +52,15 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   (link), Refresh, Approve (sends "Approved — please proceed." via messages
   API), SSH (ephemeral `ssh <id>@ssh.devin.ai` string — Cognition's gateway,
   no tunneling needed). PR cards add `pr_merge`/`pr_merge_go`/`pr_approve`/
-  `pr_close` — `extra` carries the PR number.
+  `pr_close` — `extra` carries the PR number. `ChoiceView` (action `choose`)
+  renders `choices.py`-parsed question options; the option text lives on
+  the button LABEL (state stays on the message — clicks after a restart
+  still resolve), `extra` carries only the 1-based index as fallback.
+- `choices.py` — `parse_choices` maps a relayed Devin question to button
+  options: `?`-gated, takes the LAST same-style list run (numbered/lettered
+  must be sequential from 1/A; 2–5 items ≤120 chars), else a Yes/No
+  fallback when the message ends with a confirmation-shaped `?`. Returns
+  None on anything ambiguous — a stray button row is the worst failure.
 - `github_client.py` — GitHub App client (optional). RS256 JWT from the app
   PEM → `POST /app/installations/{id}/access_tokens` → cached token (~55min
   TTL, 5min refresh margin). `parse_pr_url`/`parse_issue_ref`/`checks_state`
@@ -124,8 +134,16 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   `progress.py` renders them into ONE edited "Working…" message per turn
   (deleted on turn end — don't post one message per tool call, it spams).
 - `spawn.py::spawn_session` is THE create path — `/devin`, `/devin-all`,
-  `/schedule` rows, and the `issues:labeled` webhook all call it. Anything
-  spawn-wide (canonicalization, precedence, binding fields) belongs there.
+  `/schedule` rows, chain phases (`relay._spawn_chain_phase`), and the
+  `issues:labeled` webhook all call it. Anything spawn-wide
+  (canonicalization, precedence, binding fields) belongs there —
+  including the `repo_notes` prompt injection + `repo_notes` nudge line.
+- Repo memory: `repo_notes` table (`UNIQUE(repo, note)` — harvest re-runs
+  can't double-save). `/note` (thread→binding repo fallback), `/notes`,
+  `/unnote`. `notes_for_repos` matches `LOWER(repo)` both sides, ≤8/repo
+  newest-first, ~2k injected block. Completions harvest
+  `structured_output.repo_notes` (schema declares it; prompts nudge it)
+  via `relay._harvest_repo_notes` — `created_by="devin:<session>"`.
 - `prs.auto_merge` is `INTEGER NULL`: None means "upsert doesn't carry the
   flag" so a state-only poll can't clobber an explicit toggle. Auto-merge
   checks run EVERY poll (not in the transition dedupe) because the flag can
@@ -137,20 +155,63 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
 - Voice steering: `message.attachments` with `audio/*` (or `.waveform`)
   transcribe via Whisper when `OPENAI_API_KEY` is set; the transcript
   echoes as a quote so the user sees what Devin got.
-- `bindings.continued_from` marks respawn/`/continue` children — the
-  respawn guard is "child doesn't respawn", capping chains at depth 1.
-  `bindings.max_acu` overrides the global cap for `_check_acu` pings and
-  parks the binding at 100% (it enforces bridge sessions bot-side too,
-  where v3's `max_acu_limit` can't reach — derived-active must be computed
-  BEFORE `_check_acu` or the same tick un-parks it). `bindings.review_of`
+- `bindings.continued_from` marks respawn/`/continue`/chain children — the
+  respawn guard is "child doesn't respawn", capping respawns at depth 1;
+  it's also `child_of`'s lookup key, which makes chain advance idempotent
+  across a crash between deciding and spawning. `bindings.max_acu`
+  overrides the global cap for `_check_acu` pings and parks the binding at
+  100% (it enforces bridge sessions bot-side too, where v3's
+  `max_acu_limit` can't reach — derived-active must be computed BEFORE
+  `_check_acu` or the same tick un-parks it). `bindings.review_of`
   dedupes `devin-review` label spawns and puts a Post-review button on the
   completion card (COMMENT reviews only — never APPROVE).
+- Playbook chains (`chains.py` + `bindings.chain` JSON): each phase is a
+  `continued_from` child binding carrying
+  `{playbook, step, pending, cap, spent, pr_key, orig, auto, halted,
+  title}` — no chain table. `advance()` (pure) gates on
+  next-phase-existence → `structured_output.proceed` (explicit `False`
+  SKIPS the phase — the scan continues to the next one, so a clean
+  iterate review still reaches automerge; missing continues) →
+  `single_pr` (exactly one tracked PR; banks `pr_key` for downstream
+  phases) → chain ACU cap (`spent` rolls up across phases — a dead
+  phase's burn is rolled in via `continued_chain`). `relay
+  ._advance_chain` runs after the completion notify: Advance spawns via
+  `spawn_session` (repos/model/budget inherited; remaining-cap = `cap −
+  spent`, floored at 1; `chain.title` keeps thread names from accreting
+  ` · phase` suffixes), Ask sets `chain.pending` and the completion
+  card's `Continue →` button. A failed spawn also parks on `pending` +
+  posts a retry button — `chain_next` force-advances under the
+  per-session relay lock (pending is re-read inside, so double-taps
+  can't double-spawn; stale taps answer ephemerally). Halt sets
+  `chain.halted` + terminal `step=len(phases)` and posts the reason; a
+  halted chain ignores further completions and Continue buttons.
+  `kind="action"` phases (arm_automerge) run bot-side inside the advance
+  loop — no session — and arm the banked PR's `prs.auto_merge` then
+  resurrect the producer binding (`active=1`) so `_poll_pr` can actually
+  fire the merge; the same `has_armed_open_pr` check in `_poll` keeps
+  that binding alive until it does. Startup calls `_resume_chains`
+  (chain bindings with `status='exit'` and no halted/pending/terminal
+  marker/child) so a crash mid-advance doesn't strand a chain. An errored
+  phase can't auto-respawn past depth 1 — `_note_chain_halt` posts a
+  notice and `/continue` is the manual retry (it carries the chain via
+  `continued_chain`: pending/halted stripped, `spent` rolled).
+  `/kill` on a phase parks the binding — parked sessions can't complete,
+  so the chain dies with it. `/chain` refuses PR-gated playbooks when
+  the GitHub App isn't configured (`_sync_prs` can't fill `prs`, so
+  `single_pr` would halt on zero).
 - `Relay._presence` writes bot status only when the active-binding count
   changes, skips until `is_ready()` (the first tick can precede the ws),
   and clears at zero — all failures are swallowed, it's cosmetic.
 - Snapshot warm-start: probed (`scripts/probe_snapshots.py`) — `session/new`
   has no blueprint select and there are no update/save methods; blueprints
   auto-apply per repo so there's nothing left to build.
+- Bridge extension probe (`scripts/probe_ext.py`, Oct 2026): the CLI binary's
+  method table overstates the live surface. `session/set_mode`,
+  `session/resume`, `session/close`, `queuedMessages`, `sessionRename`,
+  `sessionHeartbeat` all → -32601; `userShellCommand` is advertised in
+  `initialize` capabilities but rejected/ignored in every wire shape (no
+  `/exec` possible — a user shell needs a normal steering turn);
+  `session/list` does work. Full table in docs/api-internals.md.
 - Test fixture leak: `Database.connect`'s aiosqlite worker thread is
   non-daemon — tests that skip `db.close()` leave pytest unable to exit
   (zombie processes accumulate). `tests/conftest.py` auto-closes every

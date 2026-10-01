@@ -4,7 +4,7 @@ from typing import Any, cast
 import discord
 
 PREFIX = "dvm"
-ACTIONS = ("ssh", "refresh", "approve",
+ACTIONS = ("ssh", "refresh", "approve", "choose", "chain_next",
            "pr_merge", "pr_merge_go", "pr_approve", "pr_close", "pr_automerge",
            "fix_ci", "send_review", "post_review")
 
@@ -135,6 +135,60 @@ class PostReviewView(discord.ui.View):
             handler=handler,
             style=discord.ButtonStyle.primary,
         ))
+
+
+class CompletionView(discord.ui.View):
+    """Buttons on a session's completion card — any subset of:
+
+    - Post review to GitHub (when `review_of` is set)
+    - Continue → {phase} (when a playbook chain is awaiting a human gate)
+
+    Both params optional; a view with neither is never constructed.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        handler: ComponentHandler,
+        *,
+        review_of: str = "",
+        chain_next_label: str = "",
+    ) -> None:
+        super().__init__(timeout=None)
+        if review_of:
+            self.add_item(_CbButton(
+                label="Post review to GitHub",
+                custom_id=make_custom_id("post_review", session_id, review_of),
+                handler=handler,
+                style=discord.ButtonStyle.primary,
+            ))
+        if chain_next_label:
+            self.add_item(_CbButton(
+                label=f"Continue → {chain_next_label}"[:80],
+                custom_id=make_custom_id("chain_next", session_id),
+                handler=handler,
+                style=discord.ButtonStyle.success,
+            ))
+
+
+class ChoiceView(discord.ui.View):
+    """One button per option on a Devin question.
+
+    Stateless like every dvm: view — the option text lives on the button's
+    own label, so post-restart clicks (on_interaction) still send the right
+    answer; `extra` carries the 1-based index only as a fallback.
+    """
+
+    def __init__(
+        self, session_id: str, options: list[str], handler: ComponentHandler
+    ) -> None:
+        super().__init__(timeout=None)
+        for i, opt in enumerate(options, 1):
+            self.add_item(_CbButton(
+                label=f"{i}. {opt}"[:80],
+                custom_id=make_custom_id("choose", session_id, str(i)),
+                handler=handler,
+            ))
 
 
 class MergeConfirmView(discord.ui.View):

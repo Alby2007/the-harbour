@@ -29,6 +29,13 @@ class _Msg:
         self.removed: list[str] = []
         self.embeds = []
         self.reference = None
+        self.components = []
+        self.edits: list[dict] = []
+
+    async def edit(self, **kw):
+        self.edits.append(kw)
+        if "content" in kw:
+            self.content = kw["content"]
 
     async def add_reaction(self, e):
         self.added.append(e)
@@ -211,3 +218,99 @@ async def test_quote_truncates_and_skips_empty():
     msg2 = _Msg(61)
     msg2.reference = _Ref(51, resolved=src2)
     assert await _quote(object(), msg2) is None
+
+
+# ---- choice buttons -------------------------------------------------------
+
+
+class _Row:
+    def __init__(self, children):
+        self.children = children
+
+
+class _Btn:
+    def __init__(self, custom_id, label):
+        self.custom_id = custom_id
+        self.label = label
+
+
+class _Response:
+    def __init__(self):
+        self.deferred = False
+        self.messages: list[str] = []
+
+    async def defer(self, **kw):
+        self.deferred = True
+
+    async def send_message(self, text, **kw):
+        self.messages.append(text)
+
+
+class _Followup:
+    def __init__(self):
+        self.messages: list[str] = []
+
+    async def send(self, text, **kw):
+        self.messages.append(text)
+
+
+class _Interaction:
+    def __init__(self, msg, custom_id, user_id=1):
+        self.message = msg
+        self.data = {"custom_id": custom_id}
+        self.response = _Response()
+        self.followup = _Followup()
+        self.user = type("U", (), {"id": user_id})()
+
+
+def _choice_msg(custom_id_prefix="dvm:choose:s1:"):
+    msg = _Msg(400, content="Which approach?")
+    msg.components = [
+        _Row([
+            _Btn(f"{custom_id_prefix}1", "1. rewrite the parser"),
+            _Btn(f"{custom_id_prefix}2", "2. the caddy config"),
+        ])
+    ]
+    return msg
+
+
+async def _choose(bot, ix, session_id="s1", idx="2", binding=None):
+    await DevinMobileBot._handle_choice(
+        bot, ix, session_id, idx, binding or _binding()
+    )
+
+
+async def test_choice_button_sends_label(tmp_path):
+    bot = await _bot(tmp_path, _binding())
+    msg = _choice_msg()
+    ix = _Interaction(msg, "dvm:choose:s1:2")
+    await _choose(bot, ix)
+    assert bot.devin.sent == [("s1", "2. the caddy config")]
+    # buttons came off and the transcript records the pick
+    assert msg.edits and msg.edits[0].get("view") is None
+    assert "(answered: 2. the caddy config)" in msg.content
+    assert bot.relay.progress.thinking_calls == 1
+    assert bot.relay.polls == ["s1"]
+
+
+async def test_choice_falls_back_to_index(tmp_path):
+    bot = await _bot(tmp_path, _binding())
+    msg = _Msg(400, content="Which?")  # no components to read a label from
+    ix = _Interaction(msg, "dvm:choose:s1:2")
+    await _choose(bot, ix)
+    assert bot.devin.sent == [("s1", "2")]
+
+
+async def test_choice_send_failure_keeps_buttons(tmp_path):
+    bot = await _bot(tmp_path, _binding())
+
+    class _FailDevin(_Devin):
+        async def send_message(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    bot.devin = _FailDevin()
+    msg = _choice_msg()
+    ix = _Interaction(msg, "dvm:choose:s1:1")
+    await _choose(bot, ix, idx="1")
+    assert any("Couldn't send" in m for m in ix.followup.messages)
+    assert not msg.edits  # view untouched — retry stays possible

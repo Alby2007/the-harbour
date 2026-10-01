@@ -6,20 +6,41 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import discord
 
 from .acp_bridge import SessionStream
+from .chains import (
+    PLAYBOOKS,
+    Ask,
+    Halt,
+    Phase,
+    advance,
+    continued_chain,
+    render_prompt,
+)
+from .choices import parse_choices
 from .config import Settings
 from .db import Binding, Database, PrRow
 from .devin_client import DevinClient
 from .embeds import completion_embed, pr_embed, status_embed
-from .github_client import GithubClient, PullRef, parse_pr_url
+from .github_client import (
+    GithubClient,
+    PullRef,
+    parse_issue_ref,
+    parse_pr_url,
+)
 from .models import Session, SessionMessage
 from .progress import ProgressTracker, chunk_text_from, summarize_update
 from .spawn import SpawnError, spawn_session
-from .views import ComponentHandler, FixCIView, PostReviewView, PRView
+from .views import (
+    ChoiceView,
+    CompletionView,
+    ComponentHandler,
+    FixCIView,
+    PRView,
+)
 
 if TYPE_CHECKING:
     from .bot.main import DevinMobileBot
@@ -185,6 +206,10 @@ class Relay:
             await self.streamer.aclose()
 
     async def run_forever(self) -> None:
+        try:
+            await self._resume_chains()
+        except Exception:
+            log.exception("chain resume sweep failed")
         while True:
             try:
                 bindings = await self.db.active_bindings()
@@ -241,6 +266,14 @@ class Relay:
         binding.active = session.status not in QUIET_STATUSES
         binding.acus = session.acus_consumed
         await self._check_acu(binding, session)
+        if (
+            not binding.active
+            and session.status in QUIET_STATUSES
+            and await self.db.has_armed_open_pr(binding.session_id)
+        ):
+            # an armed auto-merge PR on a dead session still needs polling
+            # — that's the mechanism that fires the merge once CI greens
+            binding.active = True
         if session.title:
             binding.title = session.title
         binding.status = session.status
@@ -250,8 +283,12 @@ class Relay:
         await self._update_anchor(binding, session, complete=is_complete)
         if notif:
             await self._notify(binding, session, notif)
+        if notif is not None and notif.kind == "complete" and binding.chain:
+            await self._advance_chain(binding, session)
         if notif is not None and notif.kind == "error":
-            await self._maybe_respawn(binding, session)
+            respawned = await self._maybe_respawn(binding, session)
+            if not respawned and binding.chain:
+                await self._note_chain_halt(binding)
         await self._watchdog(binding, session)
         await self.db.upsert_binding(binding)
         # Attach the session to the live-progress stream — idempotent, and
@@ -514,19 +551,44 @@ class Relay:
         if text and await self.progress.reconcile(binding, text):
             # the reply already streamed live — the preview was dropped;
             # post the canonical text once and move on
-            for i, chunk in enumerate(chunks[:8]):
-                suffix = "\n… *(truncated — see session)*" if i == 7 and len(chunks) > 8 else ""
-                await thread.send(chunk + suffix)
-            for url in attachments:
-                name = url.rsplit("/", 1)[-1] or "attachment"
-                await thread.send(f"Attachment: [{name}]({url})")
+            await self._post_text(thread, binding, chunks, attachments, text)
             return
-        for i, chunk in enumerate(chunks[:8]):
-            suffix = "\n… *(truncated — see session)*" if i == 7 and len(chunks) > 8 else ""
-            await thread.send(chunk + suffix)
-        for url in attachments:
-            name = url.rsplit("/", 1)[-1] or "attachment"
-            await thread.send(f"Attachment: [{name}]({url})")
+        await self._post_text(thread, binding, chunks, attachments, text)
+
+    async def _post_text(
+        self,
+        thread: discord.Thread,
+        binding: Binding,
+        chunks: list[str],
+        attachments: list[str],
+        text: str,
+    ) -> None:
+        """Post a relayed message's body chunks + attachment links. An
+        enumerated question gets one button per option on the final send —
+        choices sit at the tail of a message, so that's where they read."""
+        lines = [
+            chunk + (
+                "\n… *(truncated — see session)*"
+                if i == 7 and len(chunks) > 8
+                else ""
+            )
+            for i, chunk in enumerate(chunks[:8])
+        ]
+        lines += [
+            f"Attachment: [{url.rsplit('/', 1)[-1] or 'attachment'}]({url})"
+            for url in attachments
+        ]
+        view: discord.ui.View | Any = discord.utils.MISSING
+        if self._component_handler is not None:
+            options = parse_choices(text)
+            if options:
+                view = ChoiceView(
+                    binding.session_id, options, self._component_handler
+                )
+        for i, line in enumerate(lines):
+            await thread.send(
+                line, view=view if i == len(lines) - 1 else discord.utils.MISSING
+            )
 
     async def _update_anchor(
         self, binding: Binding, session: Session, *, complete: bool = False
@@ -575,35 +637,86 @@ class Relay:
             diff_file, too_big = await self._pr_diff_file(pr_row)
             if too_big:
                 text += " (diff too large for mobile — open the PR to review)"
-            # Review sessions get a Post-to-GitHub button on the card —
-            # findings land in the thread either way, the button is the
-            # deliberate step that publishes them upstream.
-            review_view = (
-                PostReviewView(
-                    binding.session_id, binding.review_of,
-                    self._component_handler,
+            # Completion-card buttons: Post-review when this was a review
+            # session (the deliberate publish step), Continue→ when a chain
+            # phase is human-gated (advance() here decides the view only;
+            # _advance_chain right after re-evaluates and acts on it).
+            chain_next = ""
+            if (
+                binding.chain
+                and binding.chain.get("halted") is None
+                and self._component_handler is not None
+            ):
+                prs = await self.db.prs_for_session(binding.session_id)
+                d = advance(binding.chain, session, pr_count=len(prs))
+                if isinstance(d, Ask):
+                    chain_next = d.phase.name
+            can_post_review = bool(
+                binding.review_of and self.github is not None
+            )
+            handler = self._component_handler
+            done_view = (
+                CompletionView(
+                    binding.session_id,
+                    handler,
+                    review_of=binding.review_of if can_post_review else "",
+                    chain_next_label=chain_next,
                 )
-                if binding.review_of
-                and self.github is not None
-                and self._component_handler
+                if handler is not None and (can_post_review or chain_next)
                 else discord.utils.MISSING
             )
             await thread.send(
                 text,
                 embed=embed,
                 file=diff_file if diff_file is not None else discord.utils.MISSING,
-                view=review_view,
+                view=done_view,
             )
+            await self._harvest_repo_notes(binding, session)
         else:
             await thread.send(text)
 
-    async def _maybe_respawn(self, binding: Binding, session: Session) -> None:
+    async def _harvest_repo_notes(
+        self, binding: Binding, session: Session
+    ) -> None:
+        """Completion write-back: structured_output.repo_notes → repo_notes
+        rows the next spawn for this repo injects into its prompt. The
+        UNIQUE(repo, note) constraint makes harvest idempotent; non-string
+        or empty entries are dropped. First repo wins on multi-repo
+        sessions — it's where the work presumptively happened."""
+        so = session.structured_output or {}
+        raw = so.get("repo_notes") or []
+        repo = binding.repos.split(",")[0] if binding.repos else ""
+        if not raw or not repo:
+            return
+        saved = 0
+        for n in raw[:8]:
+            if not isinstance(n, str) or not n.strip():
+                continue
+            if await self.db.add_note(
+                repo, n.strip()[:500], f"devin:{binding.session_id}"
+            ):
+                saved += 1
+        if not saved:
+            return
+        thread = await self._thread(binding)
+        if thread is not None:
+            await thread.send(
+                f"📝 Saved {saved} repo note{'s' if saved != 1 else ''} "
+                "— future sessions on this repo will see them."
+            )
+
+    async def _maybe_respawn(
+        self, binding: Binding, session: Session
+    ) -> bool:
         """An errored session respawns ONCE as a continuation in a fresh
         thread — seeded with the parent's structured_output summary + error
         detail so the new session continues the work instead of starting
-        cold. `continued_from` on the child prevents unbounded chains."""
+        cold. `continued_from` on the child prevents unbounded chains.
+
+        Returns True when a continuation spawned — the caller uses it to
+        decide whether a chain binding still needs a halt notice."""
         if not self.settings.auto_respawn or binding.continued_from:
-            return
+            return False
         so = session.structured_output or {}
         summary = so.get("summary") or binding.last_msg or "(none captured)"
         files = so.get("files_changed") or []
@@ -628,10 +741,12 @@ class Relay:
                 model=binding.model or None,
                 title=f"{binding.title or 'session'} (continued)",
                 continued_from=binding.session_id,
+                # roll the dead session's burn into the chain budget
+                chain=continued_chain(binding.chain, session),
             )
         except SpawnError as e:
             log.warning("auto-respawn of %s failed: %s", binding.session_id, e)
-            return
+            return False
         old_thread = await self._thread(binding)
         if old_thread is not None:
             await old_thread.send(
@@ -641,6 +756,23 @@ class Relay:
         await thread.send(
             f"↩️ Continuing {binding.url or binding.session_id} after its error."
         )
+        return True
+
+    async def _note_chain_halt(self, binding: Binding) -> None:
+        """A chain phase errored and nothing respawned it (continuations
+        cap respawns at depth 1) — the chain can't advance on its own.
+        Say so, and point at /continue: it carries the chain into a fresh
+        binding so the failed phase gets a manual retry."""
+        chain = binding.chain or {}
+        phases = PLAYBOOKS.get(str(chain.get("playbook") or ""), [])
+        step = int(chain.get("step") or 0)
+        name = phases[step].name if step < len(phases) else "?"
+        thread = await self._thread(binding)
+        if thread is not None:
+            await thread.send(
+                f"⛓️ chain **{chain.get('playbook')}** halted — phase "
+                f"`{name}` errored. `/continue` in this thread retries it."
+            )
 
     async def _presence(self, n: int) -> None:
         """Bot status = number of sessions we're actively tracking —
@@ -722,3 +854,231 @@ class Relay:
                   + (" …" if len(files) > 4 else ""),
             inline=False,
         )
+
+    # ---- playbook chains ---------------------------------------------------
+
+    async def _advance_chain(
+        self, binding: Binding, session: Session, *, force: bool = False
+    ) -> discord.Thread | None:
+        """Advance a completed phase's chain — returns the spawned phase's
+        thread (for the chain_next handler) or None on Halt/Ask/action.
+
+        The completed binding keeps its own `step`; the spawned child
+        carries `step=next_idx` + the rolled-up `spent`. `action` phases
+        consume instantly inside the loop (step advances past them so a
+        resume never re-runs them). Idempotent across a crash between
+        'decided' and 'spawned' via _resume_chains + child_of."""
+        chain = dict(binding.chain or {})
+        phases = PLAYBOOKS.get(str(chain.get("playbook") or ""), [])
+        if not phases:
+            return None
+        if chain.get("halted") is not None:
+            return None  # terminal — only /continue (a fresh phase) revives it
+        if chain.get("pending") is not None and not force:
+            return None  # a Continue→ (or spawn-retry) button is already posted
+        prs = await self.db.prs_for_session(binding.session_id)
+        spawned_thread: discord.Thread | None = None
+        while True:
+            decision = advance(chain, session, pr_count=len(prs))
+            if isinstance(decision, Halt):
+                chain["step"] = len(phases)  # terminal marker
+                chain["halted"] = decision.reason
+                chain["pending"] = None
+                binding.chain = dict(chain)
+                await self.db.upsert_binding(binding)
+                thread = await self._thread(binding)
+                if thread is not None:
+                    await thread.send(
+                        f"⛓️ chain **{chain.get('playbook')}** done — "
+                        f"{decision.reason}"
+                    )
+                return spawned_thread
+            nxt = decision.phase
+            # single_pr gate passed — bank the produced PR's key so later
+            # phases (review_of, arm_automerge) can find it
+            if nxt.gate == "single_pr" and len(prs) == 1:
+                row = prs[0]
+                if row.owner and row.repo and row.number:
+                    chain["pr_key"] = f"{row.owner}/{row.repo}#{row.number}"
+            if isinstance(decision, Ask) and not force:
+                chain["pending"] = decision.next_idx
+                binding.chain = dict(chain)
+                await self.db.upsert_binding(binding)
+                return spawned_thread
+            if nxt.kind == "action":
+                chain["step"] = decision.next_idx
+                chain["pending"] = None
+                binding.chain = dict(chain)
+                await self.db.upsert_binding(binding)
+                await self._run_chain_action(binding, nxt, chain)
+                # a forced tap authorizes ONE gated phase, not every gate
+                # downstream of an action hop
+                force = False
+                continue
+            chain["pending"] = None
+            binding.chain = dict(chain)
+            await self.db.upsert_binding(binding)
+            try:
+                spawned_thread = await self._spawn_chain_phase(
+                    binding, session, nxt, chain, decision.next_idx, len(phases)
+                )
+            except Exception:
+                # Park the chain on the failed phase: pending + a retry
+                # button beats silently waiting for the restart sweep.
+                chain["pending"] = decision.next_idx
+                binding.chain = dict(chain)
+                await self.db.upsert_binding(binding)
+                log.exception(
+                    "chain phase spawn failed for %s", binding.session_id
+                )
+                try:
+                    thread = await self._thread(binding)
+                    if thread is not None:
+                        await thread.send(
+                            f"⛓️ `{nxt.name}` failed to spawn — tap to retry.",
+                            view=(
+                                CompletionView(
+                                    binding.session_id,
+                                    self._component_handler,
+                                    chain_next_label=nxt.name,
+                                )
+                                if self._component_handler is not None
+                                else discord.utils.MISSING
+                            ),
+                        )
+                except Exception:  # noqa: BLE001 — the retry note is best-effort
+                    pass
+                raise
+            return spawned_thread
+
+    async def _spawn_chain_phase(
+        self,
+        binding: Binding,
+        session: Session,
+        phase: Phase,
+        chain: dict,
+        next_idx: int,
+        total: int,
+    ) -> discord.Thread | None:
+        """Spawn the next chain phase as a continued_from child seeded
+        with the completed session's structured output."""
+        so = session.structured_output or {}
+        pr_key = str(chain.get("pr_key") or "")
+        ctx = {
+            "orig": str(chain.get("orig") or ""),
+            "summary": str(
+                so.get("summary") or binding.last_msg or "(no summary captured)"
+            ),
+            "files": ", ".join(
+                str(f) for f in (so.get("files_changed") or [])[:20]
+            ),
+            "notes": str(so.get("notes") or ""),
+            "pr_key": pr_key,
+            "pr_url": (
+                f"https://github.com/{pr_key.replace('#', '/pull/')}"
+                if pr_key else ""
+            ),
+            "prev_url": session.url or binding.url or "",
+            "repo": binding.repos or "",
+        }
+        prompt = render_prompt(phase, ctx)
+        spent = round(float(chain.get("spent") or 0) + session.acus_consumed, 4)
+        cap = chain.get("cap")
+        budgets = [
+            b for b in (
+                (float(cap) - spent) if cap else None,
+                self.settings.max_acu_limit,
+            )
+            if b is not None
+        ]
+        # remaining can dip to ~0 on a forced advance past cap — floor at 1
+        # so the child still gets a meaningful (not uncapped) budget
+        budget = max(min(budgets), 1) if budgets else None
+        new_chain = {
+            **chain, "step": next_idx, "spent": spent, "pending": None,
+        }
+        _, child_thread = await spawn_session(
+            cast("DevinMobileBot", self.bot),
+            prompt=prompt,
+            repos=binding.repos.split(",") if binding.repos else None,
+            model=binding.model or None,
+            # chain.title is the /chain base — binding.title would accrete
+            # a " · phase" suffix every hop
+            title=f"{chain.get('title') or binding.title or chain.get('playbook')}"
+                  f" · {phase.name}",
+            budget=budget,
+            continued_from=binding.session_id,
+            review_of=pr_key if phase.review else "",
+            chain=new_chain,
+        )
+        old_thread = await self._thread(binding)
+        if old_thread is not None:
+            await old_thread.send(
+                f"⛓️ `{phase.name}` phase spawned → {child_thread.mention}"
+            )
+        await child_thread.send(
+            f"⛓️ chain **{chain.get('playbook')}** · phase {next_idx + 1}/"
+            f"{total} `{phase.name}` — continuing "
+            f"{binding.url or binding.session_id}"
+        )
+        return child_thread
+
+    async def _run_chain_action(
+        self, binding: Binding, phase: Phase, chain: dict
+    ) -> None:
+        """Bot-side chain step — resolves instantly, no session spawned."""
+        thread = await self._thread(binding)
+        if phase.action == "arm_automerge":
+            pr_key = str(chain.get("pr_key") or "")
+            ref = parse_issue_ref(pr_key) if pr_key else None
+            found = (
+                await self.db.binding_for_pr(*ref) if ref else None
+            )
+            if found is None:
+                if thread is not None:
+                    await thread.send(
+                        f"⛓️ couldn't arm auto-merge — no tracked PR "
+                        f"{pr_key or 'recorded'}."
+                    )
+                return
+            _, row = found
+            if row.state in ("merged", "closed"):
+                if thread is not None:
+                    await thread.send(
+                        f"⛓️ {pr_key} already {row.state} — nothing to merge."
+                    )
+                return
+            row.auto_merge = True
+            await self.db.upsert_pr(row)
+            # The PR belongs to an earlier phase's session — resurrect that
+            # binding's polling so _poll_pr can fire the merge on green CI.
+            prod = await self.db.get_binding(row.session_id)
+            if prod is not None and not prod.active:
+                prod.active = True
+                await self.db.upsert_binding(prod)
+            if thread is not None:
+                await thread.send(
+                    f"⛓️ auto-merge armed on {pr_key} — merges when CI "
+                    "goes green."
+                )
+
+    async def _resume_chains(self) -> None:
+        """Startup sweep: completed chain phases whose next phase never
+        spawned re-run the advance. `child_of` is the dedupe — a child
+        spawned just before a crash makes the re-run a no-op."""
+        for b in await self.db.chain_resumable():
+            chain = b.chain or {}
+            phases = PLAYBOOKS.get(str(chain.get("playbook") or ""), [])
+            if chain.get("halted") is not None:
+                continue  # terminal-marked
+            if chain.get("pending") is not None:
+                continue  # a Continue→ (or spawn-retry) button is already posted
+            if int(chain.get("step") or 0) + 1 >= len(phases):
+                continue  # ran off the end
+            if await self.db.child_of(b.session_id) is not None:
+                continue  # the next phase already spawned pre-crash
+            try:
+                session = await self.devin.get_session(b.session_id)
+                await self._advance_chain(b, session)
+            except Exception:
+                log.exception("chain resume failed for %s", b.session_id)

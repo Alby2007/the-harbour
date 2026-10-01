@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     continued_from TEXT,
     max_acu        REAL,
     review_of      TEXT,
+    chain          TEXT,
     created_at     INTEGER NOT NULL
 );
 
@@ -61,6 +62,18 @@ CREATE TABLE IF NOT EXISTS schedules (
     last_session_id  TEXT,
     created_at       INTEGER NOT NULL
 );
+
+-- Standing per-repo guidance ("tests are flaky — pytest -x"): injected into
+-- every spawn's prompt, and written back by completions harvesting
+-- structured_output.repo_notes so each session teaches the next.
+CREATE TABLE IF NOT EXISTS repo_notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo        TEXT NOT NULL,   -- owner/repo as written; matched case-insensitively
+    note        TEXT NOT NULL,
+    created_by  TEXT,            -- discord user id or "devin:<session>" for harvested
+    created_at  INTEGER NOT NULL,
+    UNIQUE(repo, note)           -- dedupe: harvest re-runs can't double-save
+);
 """
 
 # Columns added after the initial schema — table -> column -> DDL. Adding a
@@ -92,6 +105,9 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         # "owner/repo#n" this session was spawned to review — marks it for
         # the Post-to-GitHub button on completion + dedupes label events
         "review_of": "ALTER TABLE bindings ADD COLUMN review_of TEXT",
+        # playbook chain state (JSON) — travels on each phase's own row;
+        # see chains.py for the shape
+        "chain": "ALTER TABLE bindings ADD COLUMN chain TEXT",
     },
     "prs": {
         "auto_merge": (
@@ -102,6 +118,17 @@ MIGRATIONS: dict[str, dict[str, str]] = {
 
 # How many event ids to keep for replay dedupe.
 SEEN_CAP = 500
+
+
+def _parse_chain(raw: str | None) -> dict | None:
+    """bindings.chain JSON → dict; malformed/missing → None (no chain)."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 @dataclass
@@ -156,6 +183,7 @@ class Binding:
     continued_from: str = ""  # parent session id for respawned/continued
     max_acu: float | None = None  # per-task cap; None = follow global
     review_of: str = ""  # "owner/repo#n" when spawned by the review label
+    chain: dict | None = None  # playbook state — see chains.py for shape
     created_at: int = 0
 
 
@@ -221,6 +249,10 @@ class Database:
             review_of=(
                 (row["review_of"] or "") if "review_of" in row.keys() else ""
             ),
+            chain=(
+                _parse_chain(row["chain"])
+                if "chain" in row.keys() else None
+            ),
             created_at=row["created_at"] or 0,
         )
 
@@ -232,8 +264,8 @@ class Database:
                (session_id, thread_id, channel_id, anchor_msg_id, title, url,
                 status, status_detail, msg_cursor, seen_event_ids, active, model,
                 last_msg, acus, acu_warned, last_activity_at, quiet_alerted,
-                repos, continued_from, max_acu, review_of, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                repos, continued_from, max_acu, review_of, chain, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
@@ -251,7 +283,9 @@ class Database:
                                          bindings.continued_from),
                  max_acu=COALESCE(excluded.max_acu, bindings.max_acu),
                  review_of=COALESCE(NULLIF(excluded.review_of, ''),
-                                    bindings.review_of)""",
+                                    bindings.review_of),
+                 chain=COALESCE(NULLIF(excluded.chain, ''),
+                                bindings.chain)""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
@@ -261,7 +295,8 @@ class Database:
                 int(b.active), b.model, b.last_msg, b.acus, b.acu_warned,
                 b.last_activity_at or None, int(b.quiet_alerted),
                 b.repos or None, b.continued_from or None, b.max_acu,
-                b.review_of or None, b.created_at,
+                b.review_of or None,
+                json.dumps(b.chain) if b.chain else None, b.created_at,
             ),
         )
         await self._conn.commit()
@@ -386,6 +421,44 @@ class Database:
             row = await cur.fetchone()
         return self._row_to_binding(row) if row else None
 
+    async def child_of(self, session_id: str) -> Binding | None:
+        """The continuation child of a session — the idempotency key for
+        chain advance across a crash between 'decided' and 'spawned'."""
+        async with self._conn.execute(
+            "SELECT * FROM bindings WHERE continued_from = ? LIMIT 1",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return self._row_to_binding(row) if row else None
+
+    async def chain_resumable(self) -> list[Binding]:
+        """Completed chain-phase bindings — the resume sweep filters
+        terminal-marked/pending/already-continued rows Python-side."""
+        async with self._conn.execute(
+            "SELECT * FROM bindings WHERE chain IS NOT NULL AND chain != ''"
+            " AND status = 'exit'"
+        ) as cur:
+            return [self._row_to_binding(r) for r in await cur.fetchall()]
+
+    async def chained_bindings(self, limit: int = 25) -> list[Binding]:
+        """All bindings carrying chain state — backs /chains."""
+        async with self._conn.execute(
+            "SELECT * FROM bindings WHERE chain IS NOT NULL AND chain != ''"
+            " ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [self._row_to_binding(r) for r in await cur.fetchall()]
+
+    async def has_armed_open_pr(self, session_id: str) -> bool:
+        """An auto_merge-armed PR still open — keeps a dead session's
+        binding polling so the merge can actually fire when CI greens."""
+        async with self._conn.execute(
+            "SELECT 1 FROM prs WHERE session_id = ? AND auto_merge = 1"
+            " AND state = 'open' LIMIT 1",
+            (session_id,),
+        ) as cur:
+            return await cur.fetchone() is not None
+
     async def binding_for_pr(
         self, owner: str, repo: str, number: int
     ) -> tuple[Binding, PrRow] | None:
@@ -459,6 +532,66 @@ class Database:
     async def delete_schedule(self, schedule_id: int) -> bool:
         cur = await self._conn.execute(
             "DELETE FROM schedules WHERE id = ?", (schedule_id,)
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ---- repo notes ---------------------------------------------------------
+
+    async def add_note(
+        self, repo: str, note: str, created_by: str | None = None
+    ) -> bool:
+        """Insert a standing repo note; False when (repo, note) exists —
+        auto-harvest re-runs can't double-save."""
+        cur = await self._conn.execute(
+            "INSERT OR IGNORE INTO repo_notes"
+            " (repo, note, created_by, created_at) VALUES (?,?,?,?)",
+            (repo, note, created_by, int(time.time())),
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def notes_for_repos(self, repos: list[str]) -> dict[str, list[str]]:
+        """repo -> newest-first note texts (≤8/repo) for prompt injection;
+        repo match is case-insensitive."""
+        if not repos:
+            return {}
+        marks = ",".join("?" for _ in repos)
+        async with self._conn.execute(
+            "SELECT repo, note FROM repo_notes"
+            f" WHERE LOWER(repo) IN ({marks})"
+            " ORDER BY created_at DESC, id DESC",
+            tuple(r.lower() for r in repos),
+        ) as cur:
+            out: dict[str, list[str]] = {}
+            for row in await cur.fetchall():
+                bucket = out.setdefault(row["repo"], [])
+                if len(bucket) < 8:
+                    bucket.append(row["note"])
+            return out
+
+    async def list_notes(
+        self, repo: str | None = None
+    ) -> list[tuple[int, str, str]]:
+        """(id, repo, note) newest-first, ≤20 rows — backs /notes."""
+        if repo:
+            sql = (
+                "SELECT id, repo, note FROM repo_notes WHERE LOWER(repo) = ?"
+                " ORDER BY created_at DESC, id DESC LIMIT 20"
+            )
+            params: tuple = (repo.lower(),)
+        else:
+            sql = (
+                "SELECT id, repo, note FROM repo_notes"
+                " ORDER BY created_at DESC, id DESC LIMIT 20"
+            )
+            params = ()
+        async with self._conn.execute(sql, params) as cur:
+            return [(r["id"], r["repo"], r["note"]) for r in await cur.fetchall()]
+
+    async def delete_note(self, note_id: int) -> bool:
+        cur = await self._conn.execute(
+            "DELETE FROM repo_notes WHERE id = ?", (note_id,)
         )
         await self._conn.commit()
         return (cur.rowcount or 0) > 0

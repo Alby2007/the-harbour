@@ -1,19 +1,20 @@
 import asyncio
 import logging
+from typing import Any, cast
 
 import discord
 from discord import app_commands
 
 from ..acp_bridge import AcpBridge, SessionStream
 from ..config import Settings
-from ..db import Database
+from ..db import Binding, Database
 from ..devin_client import DevinClient
 from ..embeds import status_embed
 from ..github_client import GithubClient, PullRef, parse_issue_ref
 from ..links import enrich as enrich_links
 from ..relay import Relay
 from ..scheduler import Scheduler
-from ..views import MergeConfirmView, dispatch
+from ..views import CompletionView, MergeConfirmView, dispatch
 from ..webhook_server import WebhookServer, maybe_start
 from .commands import register_commands
 
@@ -412,6 +413,136 @@ class DevinMobileBot(discord.Client):
             await interaction.followup.send(
                 f"Posted the review as a comment on {extra}.", ephemeral=True
             )
+        elif action == "choose":
+            await self._handle_choice(interaction, session_id, extra, binding)
+        elif action == "chain_next":
+            if (
+                binding is None
+                or not binding.chain
+                or binding.chain.get("pending") is None
+            ):
+                await interaction.response.send_message(
+                    "This chain already moved on.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            # The check above is only a fast path — two taps can both pass
+            # it before pending clears. Take the per-session poll lock and
+            # re-read so the loser sees the consumed marker and stops.
+            async with self.relay._lock(session_id):
+                binding = await self.db.get_binding(session_id)
+                if (
+                    binding is None
+                    or not binding.chain
+                    or binding.chain.get("pending") is None
+                ):
+                    await interaction.followup.send(
+                        "This chain already moved on.", ephemeral=True
+                    )
+                    return
+                try:
+                    session = await self.devin.get_session(session_id)
+                except Exception as e:  # noqa: BLE001
+                    await interaction.followup.send(f"`{e}`", ephemeral=True)
+                    return
+                try:
+                    spawned = await self.relay._advance_chain(
+                        binding, session, force=True
+                    )
+                except Exception as e:  # noqa: BLE001
+                    await interaction.followup.send(
+                        f"Advance failed: `{e}`", ephemeral=True
+                    )
+                    return
+            # swap the Continue→ button out of the card — chain moved on
+            if interaction.message:
+                review_ok = bool(
+                    binding.review_of and self.github is not None
+                )
+                try:
+                    await interaction.message.edit(
+                        view=(
+                            CompletionView(
+                                session_id,
+                                self.handle_component,
+                                review_of=binding.review_of if review_ok else "",
+                            )
+                            if review_ok
+                            else None
+                        )
+                    )
+                except discord.HTTPException:
+                    pass
+            await interaction.followup.send(
+                (
+                    f"Phase spawned → {spawned.mention}"
+                    if spawned is not None
+                    else "Chain advanced."
+                ),
+                ephemeral=True,
+            )
+
+    async def _handle_choice(
+        self,
+        interaction: discord.Interaction,
+        session_id: str,
+        idx: str | None,
+        binding: Binding | None,
+    ) -> None:
+        """Choice-button tap on a Devin question.
+
+        The option text is stored on the button's own label — the message
+        carries the state, so post-restart clicks resolve identically. The
+        label goes to Devin verbatim ("2. the caddy config"): it reads as
+        the numbered answer the question asked for.
+        """
+        answer = None
+        cid = str(cast(dict[str, Any], interaction.data or {}).get("custom_id") or "")
+        if interaction.message:
+            for row in interaction.message.components:
+                for comp in getattr(row, "children", []):
+                    if getattr(comp, "custom_id", None) == cid:
+                        answer = getattr(comp, "label", None) or None
+        if answer is None:
+            # label gone — the bare index still answers a numbered list
+            answer = idx
+        if not answer:
+            await interaction.response.send_message(
+                "Couldn't recover which option that was.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        try:
+            await self.devin.send_message(
+                session_id,
+                answer,
+                message_as_user_id=self.settings.create_as_user_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            await interaction.followup.send(
+                f"Couldn't send: `{e}`", ephemeral=True
+            )
+            return  # view stays in place — the tap can be retried
+        # The tap is its own confirmation: buttons come off so a second tap
+        # can't double-send, and the transcript records the pick.
+        if interaction.message:
+            note = f" *(answered: {answer})*"
+            content = interaction.message.content or ""
+            try:
+                await interaction.message.edit(
+                    content=(
+                        content + note
+                        if len(content) + len(note) <= 2000
+                        else discord.utils.MISSING
+                    ),
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+        if binding is not None:
+            # same fast turnaround as typed steering
+            await self.relay.progress.thinking(binding)
+            self.relay.request_poll(binding)
 
     async def _handle_pr_action(
         self,
@@ -453,14 +584,18 @@ class DevinMobileBot(discord.Client):
         if action == "pr_automerge":
             row.auto_merge = not row.auto_merge
             await self.db.upsert_pr(row)
+            prod = await self.db.get_binding(session_id)
+            if row.auto_merge and prod is not None and not prod.active:
+                # armed on a dead session — resume polling so the merge can
+                # fire when CI greens (the poll's armed-PR check sustains it)
+                prod.active = True
+                await self.db.upsert_binding(prod)
             state = "ON — merges when CI goes green" if row.auto_merge else "off"
-            if interaction.message:
-                binding = await self.db.get_binding(session_id)
-                if binding is not None:
-                    try:
-                        await self.relay._refresh_pr_card(binding, row)
-                    except Exception:  # noqa: BLE001
-                        pass
+            if interaction.message and prod is not None:
+                try:
+                    await self.relay._refresh_pr_card(prod, row)
+                except Exception:  # noqa: BLE001
+                    pass
             await interaction.response.send_message(
                 f"Auto-merge {state} for {ref.key}.", ephemeral=True
             )

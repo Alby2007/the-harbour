@@ -18,6 +18,22 @@ DEFAULT_STRUCTURED_OUTPUT_SCHEMA: dict[str, Any] = {
         "files_changed": {"type": "array", "items": {"type": "string"}},
         "tests_passed": {"type": ["boolean", "null"]},
         "notes": {"type": "string", "description": "Follow-ups, risks, anything worth knowing."},
+        # playbook chains read this as a gate: false = no follow-up phase
+        # is worth running (prompt must opt in — set only when asked)
+        "proceed": {
+            "type": ["boolean", "null"],
+            "description": "false when there is no follow-up work worth doing",
+        },
+        # harvested into the repo_notes table on completion — the loop that
+        # lets one session teach the next (relay._harvest_repo_notes)
+        "repo_notes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Repo-specific facts future sessions should know "
+                "(flaky tests, setup quirks, conventions)"
+            ),
+        },
     },
     "required": ["summary"],
     "additionalProperties": True,

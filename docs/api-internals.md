@@ -125,6 +125,24 @@ Also present in the binary's method table: `session/load` (resume + replay),
 extension namespace (sessionRename, sessionArchiving, queuedMessages,
 sessionHeartbeat, userShellCommand, …).
 
+### Probed extensions (scripts/probe_ext.py, Oct 2026)
+
+The binary's table overstates what the bridge build actually routes. Live
+results against a throwaway session:
+
+| Surface | Wire result |
+| --- | --- |
+| `session/list` | **Works** — `{"sessions": [{"_meta": {createdAt, creatorUserId, url, orgId}, ...}]}` |
+| `session/load` | Works — response keys `[_meta, configOptions]`; **no** `SessionModeState` |
+| `session/set_mode` | `Method not found` (-32601); `setMode`/`setSessionMode` same; `set_config_option configId="mode"` → `Unknown configId` (-32602). No `availableModes`/`currentModeId` anywhere → **no per-session mode switching on this build** |
+| `cognition.ai/userShellCommand` | **Advertised** `true` in `initialize` `agentCapabilities._meta` but unreachable: rejected as a `prompt` content block (-32602 — the prompt union only accepts text/image/audio/resource_link/resource), `-32601` as a standalone method (also `_`-prefixed and `shellCommand` spellings), and **silently ignored** as a top-level `session/prompt` param (`userShellCommand` / `cognition.ai/userShellCommand`), inside a text block's `_meta`, as request `_meta`, and as a JSON-RPC notification. `echo` marker never appeared in stream updates or the v3 transcript. The capability flag exists; the route doesn't — likely gated to Cognition's own clients |
+| `cognition.ai/queuedMessages`, `cognition.ai/sessionRename`, `sessionHeartbeat`, `session/resume`, `session/close` | All `Method not found` (-32601) — `sessionRename` is likewise advertised `true` in capabilities yet unrouted |
+
+Consequence: `/exec` and `/mode` are **not** built — a user shell needs an
+agent turn (normal steering text), and there is no mode surface to switch.
+If a future CLI version ships these, re-run the probe; the capability flags
+in `initialize` are the first tell.
+
 ### Draft → materialization
 
 A `session/new` with no prompt is a draft: invisible to `GET /v3/.../sessions`

@@ -56,6 +56,7 @@ async def spawn_session(
     budget: float | None = None,
     continued_from: str = "",
     review_of: str = "",
+    chain: dict | None = None,
 ) -> tuple[Session, discord.Thread]:
     """Create a Devin session + its Discord thread + binding.
 
@@ -84,6 +85,24 @@ async def spawn_session(
             raise SpawnError(str(e)) from e
         except Exception:  # noqa: BLE001 — catalog fetch failed; pass raw
             pass
+
+    # Repo memory — standing notes for the resolved repos ride every spawn
+    # path free (canonical names where the catalog resolved, raw otherwise).
+    notes = await bot.db.notes_for_repos(repos or [])
+    if notes:
+        block = "\n".join(
+            f"- [{repo}] {n}" for repo, ns in notes.items() for n in ns
+        )[:2000]
+        prompt += (
+            "\n\n---\nRepo notes (operator-provided standing guidance):\n"
+            + block
+        )
+    # Unconditional one-liner so the harvest loop is self-filling even for
+    # repos with zero notes yet — completions write repo_notes back.
+    prompt += (
+        "\n\nIf you learn repo-specific facts worth remembering (flaky "
+        "commands, conventions), put them in structured_output.repo_notes."
+    )
 
     model_label: str | None = None
     # model beats mode; the env default only applies when neither is given
@@ -148,6 +167,7 @@ async def spawn_session(
         continued_from=continued_from,
         max_acu=budget,
         review_of=review_of,
+        chain=chain,
         last_activity_at=int(time.time()),
     )
     await bot.db.upsert_binding(binding)

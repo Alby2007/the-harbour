@@ -39,6 +39,17 @@ approval → anything you type in the thread steers the session.
   `test-coverage` / `security-scan` recipes), `/devin-all` repo fan-out,
   `devin` label on a GitHub issue auto-spawns a session, `devin-review`
   on a PR spawns a review session whose findings can post back to GitHub
+- **Playbook chains** — `/chain playbook:janitor|iterate` runs multi-phase
+  Devin workflows (audit → fix → review → auto-merge; implement → review →
+  apply → auto-merge). Each phase is its own session seeded with the last
+  phase's findings; gates on `structured_output.proceed`, "exactly one PR",
+  and a chain-wide ACU cap; mutating phases pause behind a stateless
+  **Continue →** button (`auto:yes` runs everything). Restart-safe — a
+  startup sweep resumes any chain that crashed mid-advance
+- **Repo memory** — `/note` saves standing per-repo guidance that rides
+  every future spawn's prompt (`/notes`, `/unnote`); sessions can also
+  write learnings back via `structured_output.repo_notes`, so each run
+  teaches the next
 - **Resilience** — an errored session auto-respawns once as a seeded
   continuation (summary + files + error), and `/continue` chains a
   finished session's work into a fresh one
