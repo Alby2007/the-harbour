@@ -3,7 +3,11 @@
 import asyncio
 
 from devinmobile.db import Binding
-from devinmobile.progress import ProgressTracker, summarize_update
+from devinmobile.progress import (
+    ProgressTracker,
+    chunk_text_from,
+    summarize_update,
+)
 
 
 def test_summarize_update():
@@ -20,11 +24,13 @@ def test_summarize_update():
 class _Msg:
     def __init__(self, mid):
         self.id = mid
+        self.content: str = ""
         self.edits: list[str] = []
         self.deleted = False
 
     async def edit(self, *, content: str, **kw):
         self.edits.append(content)
+        self.content = content
 
     async def delete(self):
         self.deleted = True
@@ -37,6 +43,7 @@ class _Thread:
 
     async def send(self, text, **kw):
         m = _Msg(self._next)
+        m.content = text
         self._next += 1
         self.messages[m.id] = m
         return m
@@ -109,3 +116,95 @@ async def test_thinking_cleared_by_first_reply():
     msg = next(iter(thread.messages.values()))
     await tracker.clear_thinking(b)  # reply landed before any tool call
     assert msg.deleted
+
+
+# ---- streamed reply text --------------------------------------------------
+
+
+def test_chunk_text_from_shapes():
+    assert chunk_text_from(
+        {"sessionUpdate": "agent_message_chunk",
+         "content": {"type": "text", "text": "hi"}}
+    ) == "hi"
+    assert chunk_text_from(
+        {"sessionUpdate": "agent_message_chunk",
+         "content": [{"type": "text", "text": "a"},
+                     {"type": "image"},  # ignored
+                     {"type": "text", "text": "b"}]}
+    ) == "ab"
+    assert chunk_text_from({"sessionUpdate": "agent_message_chunk"}) == ""
+
+
+async def test_stream_chunk_edits_one_message():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="r1", thread_id=1, channel_id=1)
+    await tracker.stream_chunk(b, "Hello ")
+    await tracker.stream_chunk(b, "world")  # inside the 1.2s throttle
+    assert len(thread.messages) == 1
+    await asyncio.sleep(1.4)  # let the deferred flush land
+    msg = next(iter(thread.messages.values()))
+    assert msg.content == "Hello world"
+
+
+async def test_thinking_promotes_into_reply_and_survives_done():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="r2", thread_id=1, channel_id=1)
+    await tracker.thinking(b)
+    msg = next(iter(thread.messages.values()))
+    await tracker.stream_chunk(b, "I'm on it")
+    # same message, now carrying real text
+    assert len(thread.messages) == 1
+    assert msg.content == "I'm on it"
+    await tracker.done(b)
+    assert not msg.deleted  # promoted placeholders are never deleted
+
+
+async def test_tool_line_seals_reply_and_next_chunk_opens_new():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="r3", thread_id=1, channel_id=1)
+    await tracker.stream_chunk(b, "first reply")
+    await tracker.push(b, "`run pytest`")  # seals the reply
+    await tracker.stream_chunk(b, "second message")
+    assert len(thread.messages) == 3  # reply1 + working + reply2
+    segs = tracker._replies["r3"]
+    assert len(segs) == 2 and segs[0].sealed and not segs[1].sealed
+
+
+async def test_reconcile_replaces_preview():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="r4", thread_id=1, channel_id=1)
+    await tracker.stream_chunk(b, "I found two config files — which")
+    msg = next(iter(thread.messages.values()))
+    # canonical text lands via the v3 poll: longer than the partial stream
+    assert await tracker.reconcile(
+        b, "I found two config files — which one should I use?"
+    )
+    assert msg.deleted
+    assert not tracker._replies["r4"]  # seg consumed
+
+
+async def test_reconcile_mismatch_keeps_preview():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="r5", thread_id=1, channel_id=1)
+    await tracker.stream_chunk(b, "half-written buffer")
+    assert not await tracker.reconcile(b, "a totally different message")
+    assert not next(iter(thread.messages.values())).deleted
+
+
+async def test_done_seals_but_keeps_replies_matchable():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="r6", thread_id=1, channel_id=1)
+    await tracker.stream_chunk(b, "final answer")
+    await tracker.done(b)
+    # canonical may land a poll after turn end — still reconciles
+    assert await tracker.reconcile(b, "final answer")
+    # a new turn drops unreconciled leftovers
+    await tracker.stream_chunk(b, "next turn text")
+    await tracker.thinking(b)
+    assert not tracker._replies.get("r6")

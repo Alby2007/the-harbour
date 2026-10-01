@@ -152,6 +152,12 @@ class DevinMobileBot(discord.Client):
                     log.exception("voice transcription failed")
                     await message.add_reaction("🎤")
                     return
+        if message.reference and message.reference.message_id:
+            # Reply-quoting: "yes" / "that one" means nothing to the session
+            # without what it refers to — the referenced text rides along.
+            quote = await self._reply_quote(message)
+            if quote:
+                content = f're: "{quote}"\n\n{content}'
         n_links = 0
         if content and ("http://" in content or "https://" in content):
             # Fetch link contents here — Devin's sandbox browser can't reach
@@ -190,6 +196,126 @@ class DevinMobileBot(discord.Client):
         except Exception:
             log.exception("forward failed for %s", binding.session_id)
             await message.add_reaction("\u274C")
+
+    async def _reply_quote(self, message: discord.Message) -> str | None:
+        """Resolve a reply's referenced message to a ≤300-char quote."""
+        ref = message.reference
+        if ref is None or ref.message_id is None:
+            return None
+        ref_msg = ref.resolved
+        if ref_msg is None:
+            try:
+                ref_msg = await message.channel.fetch_message(ref.message_id)
+            except (discord.HTTPException, AttributeError):
+                return None
+        if isinstance(ref_msg, discord.DeletedReferencedMessage):
+            return None
+        text = (ref_msg.content or "").strip()
+        if not text and ref_msg.embeds:
+            e = ref_msg.embeds[0]
+            text = " — ".join(
+                p for p in (e.title or "", e.description or "", e.url or "") if p
+            )
+        if not text:
+            return None
+        return " ".join(text.split())[:300]
+
+    # ---- emoji-reaction commands: one-tap steering on phone ---------------
+    # Raw events fire regardless of message cache; Intents.reactions is in
+    # Intents.default() so no extra intent wiring is needed.
+
+    _REACT_EMOJI = frozenset({"👍", "🔁", "⏸️"})
+
+    async def on_raw_reaction_add(self, event: discord.RawReactionActionEvent) -> None:
+        if event.user_id not in self.settings.allowed_user_id_set:
+            return
+        emoji = event.emoji.name or ""
+        if emoji not in self._REACT_EMOJI:
+            return
+        binding = await self.db.get_binding_by_thread(event.channel_id)
+        if binding is None:
+            return
+        chan = self.get_channel(event.channel_id) or await self.fetch_channel(
+            event.channel_id
+        )
+        if not isinstance(chan, discord.abc.Messageable):
+            return
+        try:
+            msg = await chan.fetch_message(event.message_id)
+        except (discord.HTTPException, AttributeError):
+            return
+        await self._handle_reaction(binding, msg, emoji)
+
+    async def _handle_reaction(
+        self, binding, msg: discord.Message, emoji: str
+    ) -> None:
+        is_anchor = msg.id == binding.anchor_msg_id
+        pr_row = (
+            None
+            if is_anchor
+            else await self.db.get_pr_by_card(binding.session_id, msg.id)
+        )
+        try:
+            if emoji == "👍":
+                if pr_row is not None:
+                    if self.github is None:
+                        return
+                    await self.github.approve_pr(
+                        PullRef(owner=pr_row.owner, repo=pr_row.repo,
+                                number=pr_row.number)
+                    )
+                    await msg.channel.send(
+                        f"👍 {pr_row.repo}#{pr_row.number} approved"
+                    )
+                elif is_anchor:
+                    await self.devin.send_message(
+                        binding.session_id,
+                        "Approved — please proceed.",
+                        message_as_user_id=self.settings.create_as_user_id,
+                    )
+                    await self.relay.progress.thinking(binding)
+                    self.relay.request_poll(binding)
+            elif emoji == "🔁":
+                if is_anchor:
+                    self.relay.request_poll(binding)
+                elif pr_row is not None and self.github is not None:
+                    await self.relay._poll_pr(
+                        binding, pr_row,
+                        PullRef(owner=pr_row.owner, repo=pr_row.repo,
+                                number=pr_row.number),
+                    )
+                elif any(
+                    r.me and str(r.emoji) == "❌" for r in msg.reactions
+                ):
+                    # resend a message whose original forward failed
+                    content = msg.content
+                    if "http://" in content or "https://" in content:
+                        content, _ = await enrich_links(content, self.github)
+                    await self.devin.send_message(
+                        binding.session_id,
+                        content or "(attachment)",
+                        message_as_user_id=self.settings.create_as_user_id,
+                    )
+                    await msg.add_reaction("✅")
+                    if self.user is not None:
+                        try:
+                            await msg.remove_reaction("❌", self.user)
+                        except discord.HTTPException:
+                            pass
+                    await self.relay.progress.thinking(binding)
+                    self.relay.request_poll(binding)
+            elif emoji == "⏸️" and is_anchor:
+                binding.active = False
+                await self.db.upsert_binding(binding)
+                await msg.channel.send(
+                    "⏸️ parked — reply in this thread to resume."
+                )
+        except Exception as e:  # noqa: BLE001 — reactions can't go ephemeral
+            log.exception("reaction %s failed on %s", emoji, binding.session_id)
+            try:
+                await msg.channel.send(f"`{e}`")
+            except discord.HTTPException:
+                pass
 
     # ---- component clicks (post-restart path; live views dedupe via _INFLIGHT)
 

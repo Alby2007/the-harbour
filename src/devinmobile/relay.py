@@ -15,7 +15,7 @@ from .devin_client import DevinClient
 from .embeds import completion_embed, pr_embed, status_embed
 from .github_client import GithubClient, PullRef, parse_pr_url
 from .models import Session, SessionMessage
-from .progress import ProgressTracker, summarize_update
+from .progress import ProgressTracker, chunk_text_from, summarize_update
 from .views import ComponentHandler, FixCIView, PRView
 
 log = logging.getLogger(__name__)
@@ -254,6 +254,13 @@ class Relay:
     async def on_progress(self, session_id: str, update: dict) -> None:
         """SessionStream callback — a session/update notification arrived on
         the bridge socket for an attached session."""
+        if update.get("sessionUpdate") == "agent_message_chunk":
+            text = chunk_text_from(update)
+            if text:
+                binding = await self.db.get_binding(session_id)
+                if binding is not None:
+                    await self.progress.stream_chunk(binding, text)
+            return
         line = summarize_update(update)
         if line is None:
             return
@@ -486,6 +493,16 @@ class Relay:
         await self.progress.clear_thinking(binding)
         text, attachments = extract_attachments(m.message or "")
         chunks = chunk_text(text) if text else []
+        if text and await self.progress.reconcile(binding, text):
+            # the reply already streamed live — the preview was dropped;
+            # post the canonical text once and move on
+            for i, chunk in enumerate(chunks[:8]):
+                suffix = "\n… *(truncated — see session)*" if i == 7 and len(chunks) > 8 else ""
+                await thread.send(chunk + suffix)
+            for url in attachments:
+                name = url.rsplit("/", 1)[-1] or "attachment"
+                await thread.send(f"Attachment: [{name}]({url})")
+            return
         for i, chunk in enumerate(chunks[:8]):
             suffix = "\n… *(truncated — see session)*" if i == 7 and len(chunks) > 8 else ""
             await thread.send(chunk + suffix)

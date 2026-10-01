@@ -19,7 +19,10 @@ approval → anything you type in the thread steers the session.
   Opus 5.5, GPT-6.x Sol, Fusion…) via the internal ACP bridge, not just v3's
   five `devin_mode` tiers
 - **Live relay** — Devin's messages stream into one thread per session;
-  a "Working…" message tracks live tool calls via the ACP bridge
+  a "Working…" message tracks live tool calls via the ACP bridge, and
+  replies stream token-by-token as they generate
+- **One-tap controls** — reply-quoting (`re: "…"` context), emoji commands
+  (👍 approve · 🔁 refresh/resend · ⏸️ park)
 - **Phone-friendly notifications** — @-mentions on turn end / real questions /
   approval requests / failures / PR+CI transitions; silent on routine
   suspensions

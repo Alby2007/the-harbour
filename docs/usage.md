@@ -80,6 +80,16 @@ Refreshes a session's status embed on demand (defaults to the most recent).
 - **Steering**: type anything → forwarded via `POST /messages` → ✅ reaction
   = delivered, ❌ = failed. A suspended session auto-resumes on message.
   Discord attachments ride along as `attachment_urls`.
+- **Reply-quoting**: reply to a Devin message → its text is prepended as
+  `re: "…"` so "yes" / "that one" carry context. Works on embeds too
+  (anchor and PR cards resolve to their title/link).
+- **Emoji commands** (in a bound thread): 👍 on the anchor = approve the
+  pending step; 👍 on a PR card = GitHub approve; 🔁 on the anchor = poll
+  now; 🔁 on a PR card = refresh its state; 🔁 on a ❌-marked message =
+  resend it; ⏸️ on the anchor = park (any reply resumes).
+- **Live replies**: when the ACP stream is attached, Devin's text streams
+  into a message as it generates (~1.2s edits); the canonical message
+  replaces the preview when it lands via the poll — no duplicates.
 - **Link reading**: URLs in a steering message are fetched by the bot and
   appended to the prompt as `Link context` blocks — Devin reads the text
   instead of having to browse. `github.com` issue/PR/commit/blob links go

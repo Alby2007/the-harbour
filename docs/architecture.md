@@ -67,9 +67,9 @@ state and perform merge/approve/close on the org's repos.
 | `devin_client.py` | async v3 client — retry/backoff on 429+5xx, typed `Session`/`MessagePage` |
 | `acp_bridge.py` | WS JSON-RPC client: credentials.toml → `session/new` → `set_config_option` → `session/prompt`; fuzzy model resolution against live `configOptions` |
 | `db.py` | `bindings` table: `session_id ↔ thread_id ↔ anchor_msg_id`, `msg_cursor`, `seen_event_ids` (dedupe), `active` flag, `model` label. `prs` table: one row per (session, PR) — card msg id, last notified state, CI rollup |
-| `relay.py` | one poll loop: drain new `source=="devin"` messages into the thread, then diff `status`/`status_detail` → notifications; syncs `session.pull_requests` → PR cards and polls state/CI for transitions (opt-in `auto_merge` fires on green); one-shot `channel.typing()` while mid-turn; ACU-cap alerts at 80%/100%; quiet-streak watchdog. `request_poll` coalesces immediate re-polls (per-binding lock guards against the loop racing it). `active` derives from live status each poll — a message reactivates parked sessions |
+| `relay.py` | one poll loop: drain new `source=="devin"` messages into the thread, then diff `status`/`status_detail` → notifications; syncs `session.pull_requests` → PR cards and polls state/CI for transitions (opt-in `auto_merge` fires on green); one-shot `channel.typing()` while mid-turn; ACU-cap alerts at 80%/100%; quiet-streak watchdog. `request_poll` coalesces immediate re-polls (per-binding lock guards against the loop racing it). `active` derives from live status each poll — a message reactivates parked sessions. `on_progress` routes `agent_message_chunk` → reply streaming (canonical message reconciles the preview) |
 | `acp_bridge.py` `SessionStream` | one persistent bridge WS: `session/load`s each active session, demuxes responses into pending futures while `session/update` notifications stream to `relay.on_progress` |
-| `progress.py` | `ProgressTracker` — renders tool-call titles into ONE per-turn message edited in place (~3s throttle, last 6 lines), deleted on turn end |
+| `progress.py` | `ProgressTracker` — renders tool-call titles into ONE per-turn message edited in place (~3s throttle, last 6 lines), deleted on turn end. Also owns streamed replies: `agent_message_chunk` text accumulates into a live-edited reply (~1.2s), thinking placeholders promote into it, tool calls seal a reply segment, and `reconcile()` replaces the preview when the canonical v3 message lands |
 | `spawn.py` | `spawn_session()` — the shared create path (repo canonicalization, bridge/v3 routing, thread+anchor+binding, first poll). `/devin`, `/devin-all`, `/schedule`, and the label trigger all ride it |
 | `scheduler.py` | 60s tick over the `schedules` table → `spawn_session` per due row; `next_run_at` slides from fire-time so downtime can't storm |
 | `transcribe.py` | Whisper via httpx multipart — Discord voice attachments → text for `on_message` steering. Off unless `OPENAI_API_KEY` is set |
@@ -79,7 +79,7 @@ state and perform merge/approve/close on the org's repos.
 | `embeds.py` | status + completion embeds (structured_output → summary/files/tests + GitHub diffstat) + `pr_embed` cards |
 | `views.py` | stateless buttons (`dvm:{action}:{session_id}[:{extra}]` custom_ids survive restarts; `_INFLIGHT` dedupes the double-dispatch with `on_interaction`). `PRView` carries `owner/repo#n` in `extra`; merges get a `MergeConfirmView` ephemeral step; `FixCIView`/`ReviewNotifyView` are the one-button steering views |
 | `bot/commands.py` | `/devin` `/devin-all` `/schedule` `/schedules` `/unschedule` `/sessions` `/kill` `/devin-status`, model+repo autocomplete |
-| `bot/main.py` | client wiring, allowlist gate, thread→session steering (`on_message` incl. voice-note transcription), component dispatch |
+| `bot/main.py` | client wiring, allowlist gate, thread→session steering (`on_message`: reply-quoting, link enrichment, voice-note transcription), `on_raw_reaction_add` → 👍/🔁/⏸️ commands on anchor/PR-card/failed messages, component dispatch |
 
 ## State model
 

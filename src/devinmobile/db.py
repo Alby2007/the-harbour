@@ -317,6 +317,17 @@ class Database:
             row = await cur.fetchone()
         return self._row_to_pr(row) if row else None
 
+    async def get_pr_by_card(
+        self, session_id: str, card_msg_id: int
+    ) -> PrRow | None:
+        """Reverse lookup for emoji reactions: card message id → PrRow."""
+        async with self._conn.execute(
+            "SELECT * FROM prs WHERE session_id = ? AND card_msg_id = ?",
+            (session_id, card_msg_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return self._row_to_pr(row) if row else None
+
     async def binding_for_pr(
         self, owner: str, repo: str, number: int
     ) -> tuple[Binding, PrRow] | None:
