@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import random
@@ -551,21 +552,61 @@ class Relay:
             embed = completion_embed(
                 session, fallback_title=binding.title, model=binding.model
             )
-            await self._add_diffstat(binding, embed)
-            await thread.send(text, embed=embed)
+            pr_row = await self._completion_pr(binding)
+            if pr_row is not None:
+                await self._add_diffstat(pr_row, embed)
+            diff_file, too_big = await self._pr_diff_file(pr_row)
+            if too_big:
+                text += " (diff too large for mobile — open the PR to review)"
+            await thread.send(
+                text,
+                embed=embed,
+                file=diff_file if diff_file is not None else discord.utils.MISSING,
+            )
         else:
             await thread.send(text)
 
-    async def _add_diffstat(self, binding: Binding, embed: discord.Embed) -> None:
-        """If the session produced exactly one PR, append a GitHub-sourced
-        +x/−y diffstat — the question 'how big was the change' always follows
-        'session finished' on a phone."""
+    async def _completion_pr(self, binding: Binding) -> PrRow | None:
+        """The PR to summarize on completion — only when the session produced
+        exactly one (ambiguity on multi-PR sessions isn't worth guessing)."""
+        if self.github is None:
+            return None
+        prs = await self.db.prs_for_session(binding.session_id)
+        if len(prs) != 1:
+            return None
+        row = prs[0]
+        return row if (row.owner and row.repo and row.number) else None
+
+    async def _pr_diff_file(
+        self, row: PrRow | None
+    ) -> tuple[discord.File | None, bool]:
+        """Fetch the PR's combined diff as a Discord file — reading the
+        actual change on a phone beats an embed field. Returns (file,
+        too_big) — too_big lets the caller say why no file arrived."""
+        if row is None or self.github is None:
+            return None, False
+        try:
+            diff = await self.github.get_pr_diff(
+                PullRef(owner=row.owner, repo=row.repo, number=row.number)
+            )
+        except Exception:  # noqa: BLE001 — the file is decoration
+            log.debug("diff fetch failed for %s", row.pr_url)
+            return None, False
+        if diff is None:
+            return None, True
+        return (
+            discord.File(
+                io.BytesIO(diff.encode()),
+                filename=f"{row.repo}-{row.number}.diff",
+            ),
+            False,
+        )
+
+    async def _add_diffstat(self, row: PrRow, embed: discord.Embed) -> None:
+        """Append a GitHub-sourced +x/−y diffstat — the question 'how big
+        was the change' always follows 'session finished' on a phone."""
         if self.github is None:
             return
-        prs = await self.db.prs_for_session(binding.session_id)
-        if len(prs) != 1 or not (prs[0].owner and prs[0].repo and prs[0].number):
-            return
-        row = prs[0]
         try:
             files = await self.github.get_pr_files(
                 PullRef(owner=row.owner, repo=row.repo, number=row.number)

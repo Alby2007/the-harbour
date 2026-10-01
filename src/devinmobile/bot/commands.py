@@ -1,13 +1,14 @@
 import logging
 import re
 import time
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 
 from ..acp_bridge import MODEL_ALIASES
-from ..db import ScheduleRow
+from ..db import Binding, ScheduleRow
 from ..embeds import status_embed
 from ..github_client import parse_issue_ref
 from ..spawn import SpawnError, spawn_session
@@ -72,6 +73,40 @@ async def repo_autocomplete(
 
 def _split_repos(repo: str | None) -> list[str] | None:
     return [r.strip() for r in repo.split(",") if r.strip()] if repo else None
+
+
+def usage_summary(bindings: list[Binding], now: float) -> dict:
+    """Aggregate per-session ACU burn for /usage.
+
+    `acus` is cumulative per session with no time series, so day/week
+    buckets group by session *start* (created_at) — "burn of sessions
+    started in the window", not "burn in the window". Repo attribution
+    uses the primary (first) repo only."""
+    today0 = int(
+        datetime.fromtimestamp(now).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp()
+    )
+    week0 = int((datetime.fromtimestamp(now) - timedelta(days=7)).timestamp())
+    out: dict = {
+        "today": 0.0, "week": 0.0, "total": 0.0, "count": len(bindings),
+        "top": [], "by_repo": {},
+    }
+    for b in bindings:
+        out["total"] += b.acus
+        if b.created_at >= today0:
+            out["today"] += b.acus
+        if b.created_at >= week0:
+            out["week"] += b.acus
+        repo = (b.repos.split(",")[0].strip() if b.repos else "") or "(no repo)"
+        agg = out["by_repo"].setdefault(repo, [0.0, 0])
+        agg[0] += b.acus
+        agg[1] += 1
+    out["top"] = sorted(bindings, key=lambda b: b.acus, reverse=True)[:5]
+    out["by_repo"] = dict(
+        sorted(out["by_repo"].items(), key=lambda kv: kv[1][0], reverse=True)[:8]
+    )
+    return out
 
 
 def register_commands(bot: "DevinMobileBot") -> None:
@@ -344,6 +379,49 @@ def register_commands(bot: "DevinMobileBot") -> None:
         await interaction.followup.send(
             f"Parked `{binding.session_id}` and archived its thread.", ephemeral=True
         )
+
+    @tree.command(name="usage", description="ACU burn rollup across bot sessions")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def usage_cmd(interaction: discord.Interaction) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        bindings = await bot.db.all_bindings(limit=1000)
+        if not bindings:
+            await interaction.response.send_message(
+                "No sessions yet.", ephemeral=True
+            )
+            return
+        s = usage_summary(bindings, time.time())
+        embed = discord.Embed(title="Devin usage")
+        embed.add_field(
+            name="ACU burn",
+            value=(
+                f"today **{s['today']:g}** · last 7d **{s['week']:g}** · "
+                f"all-time **{s['total']:g}**\n"
+                f"({s['count']} sessions — buckets by session start)"
+            ),
+            inline=False,
+        )
+        if s["top"]:
+            embed.add_field(
+                name="Top sessions",
+                value="\n".join(
+                    f"**{b.acus:g}** — {(b.title or b.session_id)[:60]} <#{b.thread_id}>"
+                    for b in s["top"]
+                ),
+                inline=False,
+            )
+        if s["by_repo"]:
+            embed.add_field(
+                name="By repo",
+                value="\n".join(
+                    f"`{repo}` — {acus:g} ACU ({n} session{'s' if n > 1 else ''})"
+                    for repo, (acus, n) in s["by_repo"].items()
+                ),
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @tree.command(name="devin-status", description="Refresh a session's status")
     @app_commands.describe(session="Session id (default: most recent)")

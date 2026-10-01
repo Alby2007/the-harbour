@@ -136,6 +136,27 @@ async def test_client_request_paths():
     assert seen[2][1] == "/repos/o/r/pulls/5/reviews"
 
 
+async def test_get_pr_diff_media_type_and_cap():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["accept"] = request.headers.get("accept", "")
+        return httpx.Response(200, text="diff --git a/f.py b/f.py\n+change")
+
+    gh = _gh_client(handler)
+    diff = await gh.get_pr_diff(PullRef("o", "r", 5))
+    assert "vnd.github.diff" in seen["accept"]
+    assert diff and "+change" in diff
+
+    def big(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text="x" * 500_001,
+            headers={"content-length": "500001"},
+        )
+
+    assert await _gh_client(big).get_pr_diff(PullRef("o", "r", 5)) is None
+
+
 async def test_client_error_surfaces_message():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"message": "Not Found"})

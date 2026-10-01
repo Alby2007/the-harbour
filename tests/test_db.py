@@ -1,6 +1,6 @@
 import time
 
-from devinmobile.db import Binding, Database, ScheduleRow
+from devinmobile.db import Binding, Database, PrRow, ScheduleRow
 
 
 async def test_roundtrip(tmp_path):
@@ -45,6 +45,36 @@ async def test_multiple_bindings_listed(tmp_path):
     assert len(all_b) == 3
     act = await db.active_bindings()
     assert len(act) == 3
+    await db.close()
+
+
+async def test_binding_repos_roundtrip_and_backfill(tmp_path):
+    path = str(tmp_path / "t.db")
+    db = await Database.connect(path)
+    # a session that produced a PR but predates the repos column
+    await db.upsert_binding(
+        Binding(session_id="old", thread_id=1, channel_id=1)
+    )
+    await db.upsert_pr(PrRow(
+        session_id="old", pr_url="https://github.com/o/r/pull/1",
+        owner="o", repo="r", number=1,
+    ))
+    # a spawn-time attribution + a repo-less session
+    await db.upsert_binding(Binding(
+        session_id="new", thread_id=2, channel_id=1, repos="a/b,c/d",
+    ))
+    await db.upsert_binding(Binding(session_id="none", thread_id=3, channel_id=1))
+    await db.close()
+
+    db = await Database.connect(path)  # reconnect → migration + backfill run
+    assert (await db.get_binding("new")).repos == "a/b,c/d"
+    assert (await db.get_binding("old")).repos == "o/r"  # backfilled
+    assert (await db.get_binding("none")).repos == ""
+    # a state-only upsert (repos="") must not wipe the attribution
+    b = await db.get_binding("new")
+    b.repos = ""
+    await db.upsert_binding(b)
+    assert (await db.get_binding("new")).repos == "a/b,c/d"
     await db.close()
 
 

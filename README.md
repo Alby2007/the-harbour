@@ -38,7 +38,9 @@ approval → anything you type in the thread steers the session.
 - **Automation** — `/schedule` recurring tasks, `/devin-all` repo fan-out,
   `devin` label on a GitHub issue auto-spawns a session (webhook)
 - **Guardrails** — ACU-cap pings, silence watchdog, `/kill` parking,
-  voice-note steering via Whisper
+  `/usage` burn rollup, voice-note steering via Whisper
+- **Diff-on-phone** — completion cards attach the PR's `.diff` file so the
+  actual change is readable without opening GitHub
 - **Issue/branch intake** — `/devin issue:#42 branch:feat-x` feeds GitHub
   context into the prompt
 - **Buttons** — Open · Refresh · Approve · SSH instructions

@@ -284,6 +284,35 @@ class GithubClient:
         out.sort(key=lambda x: x["at"])
         return out[-15:]
 
+    async def get_pr_diff(self, pr: PullRef, *, max_bytes: int = 400_000) -> str | None:
+        """Combined unified diff for a PR (`.diff` media type).
+
+        Returns None when the diff exceeds `max_bytes` — phone screens don't
+        want a megabyte of diff anyway. Bypasses `_req` (JSON-only) but uses
+        the same installation token."""
+        token = await self._installation_token()
+        r = await self._client.get(
+            f"{self._api}/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github.diff",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        if r.status_code >= 400:
+            detail = ""
+            try:
+                detail = r.json().get("message", "")
+            except ValueError:
+                detail = r.text[:200]
+            raise GithubError(
+                f"GET diff {pr.key}: HTTP {r.status_code} {detail}".strip()
+            )
+        cl = r.headers.get("content-length")
+        if cl and int(cl) > max_bytes:
+            return None
+        return r.text if len(r.content) <= max_bytes else None
+
     async def merge_pr(self, pr: PullRef, method: str = "squash") -> dict[str, Any]:
         return await self._req(
             "PUT",

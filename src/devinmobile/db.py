@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     acu_warned     INTEGER NOT NULL DEFAULT 0,
     last_activity_at INTEGER,
     quiet_alerted  INTEGER NOT NULL DEFAULT 0,
+    repos          TEXT,
     created_at     INTEGER NOT NULL
 );
 
@@ -77,6 +78,9 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         "quiet_alerted": (
             "ALTER TABLE bindings ADD COLUMN quiet_alerted INTEGER NOT NULL DEFAULT 0"
         ),
+        # comma-joined canonical owner/repo list — powers /usage per-repo
+        # rollup; backfilled from prs where a session produced one
+        "repos": "ALTER TABLE bindings ADD COLUMN repos TEXT",
     },
     "prs": {
         "auto_merge": (
@@ -137,6 +141,7 @@ class Binding:
     acu_warned: int = 0  # bitmask: 1 = 80% pinged, 2 = 100% pinged
     last_activity_at: int = 0  # watchdog anchor; 0 = fall back to created_at
     quiet_alerted: bool = False
+    repos: str = ""  # comma-joined canonical owner/repo, set at spawn
     created_at: int = 0
 
 
@@ -155,6 +160,18 @@ class Database:
             for col, ddl in cols_ddl.items():
                 if col not in cols:
                     await conn.execute(ddl)
+        # Backfill: sessions that produced a PR get their repo from the prs
+        # table; PR-less history stays repo-less and groups under "(no repo)".
+        await conn.execute(
+            """UPDATE bindings SET repos = (
+                 SELECT p.owner || '/' || p.repo FROM prs p
+                   WHERE p.session_id = bindings.session_id
+                     AND p.owner != '' AND p.repo != '' LIMIT 1)
+               WHERE (repos IS NULL OR repos = '')
+                 AND EXISTS (SELECT 1 FROM prs p2
+                    WHERE p2.session_id = bindings.session_id
+                      AND p2.owner != '' AND p2.repo != '')"""
+        )
         await conn.commit()
         return cls(conn)
 
@@ -181,6 +198,7 @@ class Database:
             acu_warned=row["acu_warned"] or 0,
             last_activity_at=row["last_activity_at"] or 0,
             quiet_alerted=bool(row["quiet_alerted"]),
+            repos=(row["repos"] or "") if "repos" in row.keys() else "",
             created_at=row["created_at"] or 0,
         )
 
@@ -192,8 +210,8 @@ class Database:
                (session_id, thread_id, channel_id, anchor_msg_id, title, url,
                 status, status_detail, msg_cursor, seen_event_ids, active, model,
                 last_msg, acus, acu_warned, last_activity_at, quiet_alerted,
-                created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                repos, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
@@ -203,7 +221,10 @@ class Database:
                  model=excluded.model, last_msg=excluded.last_msg,
                  acus=excluded.acus, acu_warned=excluded.acu_warned,
                  last_activity_at=excluded.last_activity_at,
-                 quiet_alerted=excluded.quiet_alerted""",
+                 quiet_alerted=excluded.quiet_alerted,
+                 -- a state-only upsert (repos="") must not wipe the
+                 -- spawn-time repo attribution
+                 repos=COALESCE(NULLIF(excluded.repos, ''), bindings.repos)""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
@@ -211,7 +232,8 @@ class Database:
                 # lexicographically smallest (uuid ids don't sort by time)
                 json.dumps(b.seen_event_ids[-SEEN_CAP:]),
                 int(b.active), b.model, b.last_msg, b.acus, b.acu_warned,
-                b.last_activity_at or None, int(b.quiet_alerted), b.created_at,
+                b.last_activity_at or None, int(b.quiet_alerted),
+                b.repos or None, b.created_at,
             ),
         )
         await self._conn.commit()

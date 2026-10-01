@@ -139,6 +139,7 @@ async def spawn_session(
         status=session.status,
         status_detail=session.status_detail,
         model=model_label,
+        repos=",".join(repos or []),
         last_activity_at=int(time.time()),
     )
     await bot.db.upsert_binding(binding)

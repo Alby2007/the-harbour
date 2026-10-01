@@ -67,6 +67,12 @@ Parks a session: stops tracking, archives the thread, posts a marker.
 Defaults to the current thread's session when run inside one. Also tries a
 v3 `DELETE` (undocumented — best-effort to stop ACU burn sooner).
 
+### `/usage`
+
+ACU burn rollup across sessions this bot started: today / last 7d /
+all-time, top 5 sessions by burn, and a per-repo breakdown. Day buckets
+group by session *start* (ACU is cumulative per session, not per day).
+
 ### `/devin-status [session_id]`
 
 Refreshes a session's status embed on demand (defaults to the most recent).
@@ -158,7 +164,7 @@ Devin picks the work up.
 | `waiting_for_user`, last msg ends with `?` | ✅ | `Devin is asking: "{question}"` |
 | `waiting_for_user`, otherwise | ✅ | `Devin finished its turn — reply here to continue.` |
 | `waiting_for_approval` | ✅ | `Devin needs an approval — tap Approve or open the session.` |
-| `exit` / `finished` | ✅ | `Session finished.` + completion embed (structured summary, files, tests when available) |
+| `exit` / `finished` | ✅ | `Session finished.` + completion embed (structured summary, files, tests when available) + `.diff` file when the session produced exactly one PR |
 | `error` | ✅ | `Session errored.` |
 | `suspended` (`out_of_credits`/`out_of_quota`/`usage_limit_exceeded`) | ✅ | `Session suspended (…) — needs attention.` |
 | `suspended` (`inactivity`/`user_request`) | ❌ | `Session suspended (…) — reply here to resume it.` |
