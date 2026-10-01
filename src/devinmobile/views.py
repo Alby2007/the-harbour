@@ -6,7 +6,7 @@ import discord
 PREFIX = "dvm"
 ACTIONS = ("ssh", "refresh", "approve",
            "pr_merge", "pr_merge_go", "pr_approve", "pr_close", "pr_automerge",
-           "fix_ci", "send_review")
+           "fix_ci", "send_review", "post_review")
 
 ComponentHandler = Callable[[discord.Interaction, str, str, str | None], Awaitable[None]]
 
@@ -118,6 +118,22 @@ class ReviewNotifyView(discord.ui.View):
             custom_id=make_custom_id("send_review", session_id, pr_key),
             handler=handler,
             style=discord.ButtonStyle.secondary,
+        ))
+
+
+class PostReviewView(discord.ui.View):
+    """Button on a review session's completion card — posts the review
+    findings upstream as a COMMENT review on the human's PR."""
+
+    def __init__(
+        self, session_id: str, pr_key: str, handler: ComponentHandler
+    ) -> None:
+        super().__init__(timeout=None)
+        self.add_item(_CbButton(
+            label="Post review to GitHub",
+            custom_id=make_custom_id("post_review", session_id, pr_key),
+            handler=handler,
+            style=discord.ButtonStyle.primary,
         ))
 
 

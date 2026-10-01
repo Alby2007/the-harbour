@@ -378,6 +378,40 @@ class DevinMobileBot(discord.Client):
                 await interaction.followup.send(f"Approve failed: `{e}`", ephemeral=True)
                 return
             await interaction.followup.send("Sent an approval to the session.", ephemeral=True)
+        elif action == "post_review":
+            if self.github is None or not extra:
+                await interaction.response.send_message(
+                    "GitHub App isn't configured (GITHUB_APP_*).", ephemeral=True
+                )
+                return
+            ref_parsed = parse_issue_ref(extra)
+            if ref_parsed is None:
+                await interaction.response.send_message(
+                    f"Bad PR reference {extra!r}.", ephemeral=True
+                )
+                return
+            o, r, n = ref_parsed
+            await interaction.response.defer(ephemeral=True)
+            try:
+                sess = await self.devin.get_session(session_id)
+                so = sess.structured_output or {}
+                body = (
+                    (binding.last_msg if binding else None)
+                    or so.get("summary")
+                    or "(review completed — see the session for details)"
+                )
+                await self.github.create_pr_review(
+                    PullRef(owner=o, repo=r, number=n),
+                    f"**Devin review** ({sess.url or session_id}):\n\n{body}",
+                )
+            except Exception as e:  # noqa: BLE001
+                await interaction.followup.send(
+                    f"Posting failed: `{e}`", ephemeral=True
+                )
+                return
+            await interaction.followup.send(
+                f"Posted the review as a comment on {extra}.", ephemeral=True
+            )
 
     async def _handle_pr_action(
         self,

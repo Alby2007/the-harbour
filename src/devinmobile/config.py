@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     bridge_timeout: float = 60.0
     # stream session/update progress into threads via a persistent bridge WS
     acp_progress: bool = True
+    # an errored session auto-respawns once as a seeded continuation
+    auto_respawn: bool = True
 
     # GitHub App — powers PR cards/actions, CI status, issue intake, webhooks.
     github_app_id: str = ""
@@ -44,6 +46,7 @@ class Settings(BaseSettings):
     github_webhook_port: int = 8977
     github_merge_method: str = "squash"  # merge | squash | rebase
     github_trigger_label: str = "devin"  # labeling an issue spawns a session
+    github_review_label: str = "devin-review"  # labeling a PR spawns a review
 
     @cached_property
     def github_enabled(self) -> bool:

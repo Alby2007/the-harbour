@@ -6,6 +6,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
 
 import discord
 
@@ -17,7 +18,11 @@ from .embeds import completion_embed, pr_embed, status_embed
 from .github_client import GithubClient, PullRef, parse_pr_url
 from .models import Session, SessionMessage
 from .progress import ProgressTracker, chunk_text_from, summarize_update
-from .views import ComponentHandler, FixCIView, PRView
+from .spawn import SpawnError, spawn_session
+from .views import ComponentHandler, FixCIView, PostReviewView, PRView
+
+if TYPE_CHECKING:
+    from .bot.main import DevinMobileBot
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +155,7 @@ class Relay:
         self._locks: dict[str, asyncio.Lock] = {}
         self._repoll: set[str] = set()  # sessions needing one more pass
         self._tasks: set[asyncio.Task] = set()
+        self._last_presence = -1  # forces one presence write on first tick
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._locks.setdefault(session_id, asyncio.Lock())
@@ -181,7 +187,9 @@ class Relay:
     async def run_forever(self) -> None:
         while True:
             try:
-                for binding in await self.db.active_bindings():
+                bindings = await self.db.active_bindings()
+                await self._presence(len(bindings))
+                for binding in bindings:
                     try:
                         await self.poll_binding(binding)
                     except Exception:
@@ -228,6 +236,9 @@ class Relay:
         if had_activity:
             binding.last_activity_at = int(time.time())
             binding.quiet_alerted = False
+        # Derived-active BEFORE _check_acu — a budget-hit park must not be
+        # overwritten by the status-derived value on the same tick.
+        binding.active = session.status not in QUIET_STATUSES
         binding.acus = session.acus_consumed
         await self._check_acu(binding, session)
         if session.title:
@@ -239,10 +250,9 @@ class Relay:
         await self._update_anchor(binding, session, complete=is_complete)
         if notif:
             await self._notify(binding, session, notif)
+        if notif is not None and notif.kind == "error":
+            await self._maybe_respawn(binding, session)
         await self._watchdog(binding, session)
-        # Derived from the live status so a stale write can't strand a
-        # reactivated thread in the parked state.
-        binding.active = session.status not in QUIET_STATUSES
         await self.db.upsert_binding(binding)
         # Attach the session to the live-progress stream — idempotent, and
         # self-heals after a stream reconnect (attached set is cleared then).
@@ -275,7 +285,8 @@ class Relay:
     async def _check_acu(self, binding: Binding, session: Session) -> None:
         """Ping once when ACU burn crosses 80%/100% of the configured cap —
         the cap being hit mid-task is exactly when a phone ping matters."""
-        cap = self.settings.max_acu_limit
+        # Per-task cap (budget: on /devin) wins over the global default.
+        cap = binding.max_acu or self.settings.max_acu_limit
         if not cap or cap <= 0:
             return
         frac = session.acus_consumed / cap
@@ -291,9 +302,14 @@ class Relay:
                     Notification(
                         "acu",
                         f"ACU usage {label}: {session.acus_consumed:g} of "
-                        f"{cap} ACUs consumed.",
+                        f"{cap} ACUs consumed."
+                        + (" — parked." if threshold >= 1.0 else ""),
                     ),
                 )
+                if threshold >= 1.0:
+                    # v3's own max_acu_limit enforces server-side; this parks
+                    # the binding so our side stops polling/pinging too.
+                    binding.active = False
 
     async def _watchdog(self, binding: Binding, session: Session) -> None:
         """A 'running' session that hasn't said anything in a while posts one
@@ -558,13 +574,92 @@ class Relay:
             diff_file, too_big = await self._pr_diff_file(pr_row)
             if too_big:
                 text += " (diff too large for mobile — open the PR to review)"
+            # Review sessions get a Post-to-GitHub button on the card —
+            # findings land in the thread either way, the button is the
+            # deliberate step that publishes them upstream.
+            review_view = (
+                PostReviewView(
+                    binding.session_id, binding.review_of,
+                    self._component_handler,
+                )
+                if binding.review_of
+                and self.github is not None
+                and self._component_handler
+                else discord.utils.MISSING
+            )
             await thread.send(
                 text,
                 embed=embed,
                 file=diff_file if diff_file is not None else discord.utils.MISSING,
+                view=review_view,
             )
         else:
             await thread.send(text)
+
+    async def _maybe_respawn(self, binding: Binding, session: Session) -> None:
+        """An errored session respawns ONCE as a continuation in a fresh
+        thread — seeded with the parent's structured_output summary + error
+        detail so the new session continues the work instead of starting
+        cold. `continued_from` on the child prevents unbounded chains."""
+        if not self.settings.auto_respawn or binding.continued_from:
+            return
+        so = session.structured_output or {}
+        summary = so.get("summary") or binding.last_msg or "(none captured)"
+        files = so.get("files_changed") or []
+        prompt = (
+            "A previous Devin session errored mid-task — continue its work.\n\n"
+            f"Previous session: {binding.url or binding.session_id}\n"
+            f"Progress summary: {summary}\n"
+        )
+        if files:
+            prompt += f"Files touched: {', '.join(files[:20])}\n"
+        if session.status_detail:
+            prompt += f"Error detail: {session.status_detail}\n"
+        prompt += (
+            "\nInspect the repo state first to see what already landed, "
+            "then carry the task forward."
+        )
+        try:
+            _, thread = await spawn_session(
+                cast("DevinMobileBot", self.bot),  # the real bot, not Client
+                prompt=prompt,
+                repos=binding.repos.split(",") if binding.repos else None,
+                model=binding.model or None,
+                title=f"{binding.title or 'session'} (continued)",
+                continued_from=binding.session_id,
+            )
+        except SpawnError as e:
+            log.warning("auto-respawn of %s failed: %s", binding.session_id, e)
+            return
+        old_thread = await self._thread(binding)
+        if old_thread is not None:
+            await old_thread.send(
+                "🔁 This session errored — respawned as a continuation in "
+                f"{thread.mention}."
+            )
+        await thread.send(
+            f"↩️ Continuing {binding.url or binding.session_id} after its error."
+        )
+
+    async def _presence(self, n: int) -> None:
+        """Bot status = number of sessions we're actively tracking —
+        glanceable answer to 'is Devin doing anything right now'."""
+        if n == self._last_presence:
+            return
+        self._last_presence = n
+        try:
+            await self.bot.change_presence(
+                activity=(
+                    discord.Activity(
+                        type=discord.ActivityType.watching,
+                        name=f"{n} Devin session{'s' if n != 1 else ''}",
+                    )
+                    if n
+                    else None  # idle — don't advertise a zero
+                )
+            )
+        except discord.HTTPException:
+            log.debug("presence update failed", exc_info=True)
 
     async def _completion_pr(self, binding: Binding) -> PrRow | None:
         """The PR to summarize on completion — only when the session produced

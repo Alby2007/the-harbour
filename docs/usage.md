@@ -17,6 +17,7 @@ Creates a session and its thread.
 | `branch` | optional | Base branch for the work — adds a "checkout from origin/branch" line to the prompt |
 | `mode` | optional | v3 `devin_mode` tier — `lite`/`normal`/`fast`/`ultra`/`fusion`. Ignored when `model:` is set (the model select supersedes it). Beats `DEVIN_DEFAULT_MODEL` when passed explicitly |
 | `title` | optional | Thread/session title; defaults to the prompt (or the issue title when `issue:` is set) |
+| `budget` | optional | Per-task ACU cap. At 100% the session is parked on our side (and v3's own `max_acu_limit` stops it server-side on the v3 path). Overrides `MAX_ACU_LIMIT` for this session's 80%/100% pings |
 
 `DEVIN_DEFAULT_MODEL` (env) applies a model to every `/devin` call that passes
 neither `model:` nor `mode:`. Option order in Discord is fixed — required
@@ -43,14 +44,23 @@ Recurring sessions — the task queue that runs while you sleep.
 
 | Option | Type | Notes |
 | --- | --- | --- |
-| `prompt` | required | What Devin does each run |
 | `every` | required | `30m`, `6h`, `1d`, … (min 5m) |
+| `prompt` | optional | What Devin does each run — or pick a `recipe:` |
+| `recipe` | optional, choice | Canned maintenance loop: `dep-audit` (outdated + vulnerable deps → upgrade PR), `test-coverage` (coverage gaps → test PR), `security-scan` (scanners + secrets/auth audit → severity report). A `prompt:` given alongside is appended to the recipe |
 | `repo` | optional, autocomplete | Repo(s) for each run |
 | `model` | optional | Model alias (bridge) |
 
 Rows persist in SQLite and survive restarts. A downtime doesn't
 catch-fire the backlog — `next_run_at` slides forward from the actual fire
 time.
+
+### `/continue`
+
+Run inside a finished/errored/suspended session's thread: spawns a fresh
+session seeded with the old one's `structured_output` summary, files
+touched, repo(s), model, and budget — plus your `notes:` if given. The old
+thread links to the new one. Sessions still `running` are refused — reply
+to steer instead.
 
 ### `/schedules` / `/unschedule <id>`
 
@@ -112,6 +122,13 @@ Refreshes a session's status embed on demand (defaults to the most recent).
   transcript echoes back as a quote so you can see what was sent.
 - **Silence watchdog**: a session that's `running` but quiet for
   `SILENCE_ALERT_MINUTES` (default 20) posts one quiet note — no ping.
+- **Auto-respawn**: when a session transitions to `error`, a continuation
+  session spawns automatically in a new thread — seeded with the dead
+  session's summary, files touched, and error detail. One deep only
+  (a respawned session won't respawn again). `AUTO_RESPAWN=0` disables.
+- **Presence**: the bot's Discord status shows how many sessions it's
+  actively tracking (`watching N Devin sessions`) — glanceable "is it
+  doing anything" without opening a thread.
 
 ## Buttons (anchor embed)
 
@@ -155,6 +172,13 @@ the issue title+body become the prompt, the repo is attached, and the new
 thread notes where it came from. Fill the issue tracker from anywhere;
 Devin picks the work up.
 
+Adding the `devin-review` label (`GITHUB_REVIEW_LABEL`) to a **pull
+request** spawns a review session instead: Devin reads the diff and posts
+findings in its thread as a numbered file:line list. One session per PR —
+re-labeling is a no-op, and bot-authored PRs are ignored. The completion
+card carries a **Post review to GitHub** button that publishes the
+findings as a `COMMENT` review (never APPROVE — merging stays human).
+
 ## Notifications
 
 @-mention = phone push. Non-mentions post quietly in the thread.
@@ -165,13 +189,13 @@ Devin picks the work up.
 | `waiting_for_user`, otherwise | ✅ | `Devin finished its turn — reply here to continue.` |
 | `waiting_for_approval` | ✅ | `Devin needs an approval — tap Approve or open the session.` |
 | `exit` / `finished` | ✅ | `Session finished.` + completion embed (structured summary, files, tests when available) + `.diff` file when the session produced exactly one PR |
-| `error` | ✅ | `Session errored.` |
+| `error` | ✅ | `Session errored.` (then auto-respawn posts a continuation link) |
 | `suspended` (`out_of_credits`/`out_of_quota`/`usage_limit_exceeded`) | ✅ | `Session suspended (…) — needs attention.` |
 | `suspended` (`inactivity`/`user_request`) | ❌ | `Session suspended (…) — reply here to resume it.` |
 | PR merged / closed | ✅ / ❌ | `PR #n merged` / `PR #n closed.` |
 | PR CI → success | ✅ | `PR #n — CI green ✅` |
 | PR CI → failure | ✅ | `PR #n — CI failing ❌` (with Fix-CI button) |
-| ACU ≥80% / ≥100% of `MAX_ACU_LIMIT` | ✅ | `ACU usage is nearing/hit the cap: N of M ACUs` |
+| ACU ≥80% / ≥100% of cap (`budget:` or `MAX_ACU_LIMIT`) | ✅ | `ACU usage is nearing/hit the cap: N of M ACUs` — at 100% the session parks |
 | running + silent > `SILENCE_ALERT_MINUTES` | ❌ | `Devin has been quiet for ~Nmin — likely still working.` |
 
 Notification texts live in `classify_transition` in `src/devinmobile/relay.py`.

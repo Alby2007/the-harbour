@@ -85,6 +85,10 @@ class WebhookServer:
     # ---- events -----------------------------------------------------------
 
     async def _on_pull_request(self, payload: dict) -> None:
+        # the review label rides the same event type — check it before the
+        # "not one of ours" early-return (reviewed PRs belong to humans)
+        if payload.get("action") == "labeled":
+            await self._on_pr_label(payload)
         repo = payload.get("repository", {})
         pr = payload.get("pull_request", {})
         owner = repo.get("owner", {}).get("login", "")
@@ -162,6 +166,50 @@ class WebhookServer:
         except SpawnError as e:
             log.warning("label trigger spawn failed for %s/%s#%s: %s",
                         owner, name, issue.get("number"), e)
+
+    async def _on_pr_label(self, payload: dict) -> None:
+        """`devin-review` label on a PR spawns a review session — Devin as
+        reviewer instead of author. One session per PR via the review_of
+        binding column; findings land in the thread, posting them back to
+        GitHub is a button press on the completion card."""
+        label = (payload.get("label") or {}).get("name") or ""
+        if label.lower() != self.bot.settings.github_review_label.lower():
+            return
+        pr = payload.get("pull_request") or {}
+        repo = payload.get("repository") or {}
+        owner = (repo.get("owner") or {}).get("login") or ""
+        name = repo.get("name") or ""
+        number = int(pr.get("number") or 0)
+        author = ((pr.get("user") or {}).get("login")) or ""
+        if not (owner and name and number):
+            return
+        if author.endswith("[bot]"):
+            return  # don't auto-review Devin's own PRs
+        key = f"{owner}/{name}#{number}"
+        if await self.db.binding_by_review_of(key) is not None:
+            return  # already reviewed/ing — label re-application is a no-op
+        from .spawn import SpawnError, spawn_session  # local: import cycle
+
+        prompt = (
+            f"Review pull request {key}: \"{pr.get('title') or ''}\".\n\n"
+            f"PR description:\n{(pr.get('body') or '')[:3000]}\n\n"
+            f"In repo {owner}/{name} read the diff "
+            f"(`gh pr diff {number} --repo {owner}/{name}` or the API) and "
+            f"review for bugs, security issues, and regressions. Report "
+            f"findings as a numbered list with file:line references; if the "
+            f"change is clean, say so plainly. Do not modify the PR."
+        )
+        try:
+            _, thread = await spawn_session(
+                self.bot, prompt=prompt, repos=[f"{owner}/{name}"],
+                title=f"Review {name}#{number}", review_of=key,
+            )
+            await thread.send(
+                f"Spawned by `{label}` label on {key} — review findings will "
+                "land here; the completion card can post them to GitHub."
+            )
+        except SpawnError as e:
+            log.warning("review-label spawn failed for %s: %s", key, e)
 
     async def _on_review(self, payload: dict) -> None:
         """PR review events → excerpt into the owning thread with a

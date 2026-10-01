@@ -53,6 +53,9 @@ async def spawn_session(
     model: str | None = None,
     mode: str | None = None,
     title: str | None = None,
+    budget: float | None = None,
+    continued_from: str = "",
+    review_of: str = "",
 ) -> tuple[Session, discord.Thread]:
     """Create a Devin session + its Discord thread + binding.
 
@@ -111,7 +114,9 @@ async def spawn_session(
                 devin_mode=mode or bot.settings.devin_mode,
                 title=title,
                 tags=[SESSION_TAG],
-                max_acu_limit=bot.settings.max_acu_limit,
+                max_acu_limit=(
+                    int(budget) if budget else bot.settings.max_acu_limit
+                ),
                 create_as_user_id=bot.settings.create_as_user_id,
             )
         except Exception as e:
@@ -140,6 +145,9 @@ async def spawn_session(
         status_detail=session.status_detail,
         model=model_label,
         repos=",".join(repos or []),
+        continued_from=continued_from,
+        max_acu=budget,
+        review_of=review_of,
         last_activity_at=int(time.time()),
     )
     await bot.db.upsert_binding(binding)

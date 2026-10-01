@@ -35,10 +35,17 @@ approval → anything you type in the thread steers the session.
   state + CI status and **Merge / Approve / Close** buttons (GitHub App)
 - **PR loop, closed** — Merge/Approve/Close/Auto-merge buttons, CI-failure
   "Ask Devin to fix", review comments relayed back to the session
-- **Automation** — `/schedule` recurring tasks, `/devin-all` repo fan-out,
-  `devin` label on a GitHub issue auto-spawns a session (webhook)
-- **Guardrails** — ACU-cap pings, silence watchdog, `/kill` parking,
-  `/usage` burn rollup, voice-note steering via Whisper
+- **Automation** — `/schedule` recurring tasks (with canned `dep-audit` /
+  `test-coverage` / `security-scan` recipes), `/devin-all` repo fan-out,
+  `devin` label on a GitHub issue auto-spawns a session, `devin-review`
+  on a PR spawns a review session whose findings can post back to GitHub
+- **Resilience** — an errored session auto-respawns once as a seeded
+  continuation (summary + files + error), and `/continue` chains a
+  finished session's work into a fresh one
+- **Guardrails** — per-task `/devin budget:` ACU caps (auto-park at 100%),
+  global cap pings, silence watchdog, `/kill` parking, `/usage` burn
+  rollup, voice-note steering via Whisper
+- **Presence** — the bot's Discord status shows `N Devin sessions running`
 - **Diff-on-phone** — completion cards attach the PR's `.diff` file so the
   actual change is readable without opening GitHub
 - **Issue/branch intake** — `/devin issue:#42 branch:feat-x` feeds GitHub

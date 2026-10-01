@@ -22,6 +22,30 @@ DEVIN_MODES = ["lite", "normal", "fast", "ultra", "fusion"]
 
 NOT_ALLOWED = "This bot is locked to its owner."
 
+# /schedule recipe: canned maintenance loops — one-tap instead of
+# prompt-writing. Prompts are deliberately specific about output shape so
+# the nightly run produces a reviewable artifact, not a vibes report.
+RECIPES: dict[str, str] = {
+    "dep-audit": (
+        "Audit this repository's dependencies. List outdated packages and "
+        "flag known-vulnerable versions (pip-audit / npm audit / cargo "
+        "audit — whatever fits the stack). Open a PR upgrading the safe "
+        "ones, and end with a summary of what you found and what changed."
+    ),
+    "test-coverage": (
+        "Measure test coverage for this repository with the stack's "
+        "tooling (pytest --cov, nyc, tarpaulin, …). Identify the "
+        "least-covered critical modules, add tests for the top gaps, and "
+        "open a PR with the new tests plus a coverage summary."
+    ),
+    "security-scan": (
+        "Security-review this repository: run the available scanners "
+        "(bandit / semgrep / trivy as appropriate), audit secrets handling "
+        "and auth paths, and check dependencies for CVEs. Report findings "
+        "by severity in your final message; fix trivial ones in a PR."
+    ),
+}
+
 # /schedule every: values — 30m, 6h, 1d
 EVERY_RE = re.compile(r"^(\d+)([mhd])$", re.IGNORECASE)
 _EVERY_SECONDS = {"m": 60, "h": 3600, "d": 86400}
@@ -124,6 +148,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         branch="Base branch to work from (added to the prompt)",
         mode="Agent mode (default from env)",
         title="Thread/session title",
+        budget="Per-task ACU cap — session parks when burn reaches it",
     )
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in DEVIN_MODES])
     @app_commands.autocomplete(model=model_autocomplete, repo=repo_autocomplete)
@@ -137,9 +162,15 @@ def register_commands(bot: "DevinMobileBot") -> None:
         branch: str | None = None,
         mode: str | None = None,
         title: str | None = None,
+        budget: int | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if budget is not None and budget <= 0:
+            await interaction.response.send_message(
+                "`budget:` must be a positive number of ACUs.", ephemeral=True
+            )
             return
         repos = _split_repos(repo)
         if issue and not bot.settings.github_enabled:
@@ -179,7 +210,8 @@ def register_commands(bot: "DevinMobileBot") -> None:
 
         try:
             session, thread = await spawn_session(
-                bot, prompt=prompt, repos=repos, model=model, mode=mode, title=title,
+                bot, prompt=prompt, repos=repos, model=model, mode=mode,
+                title=title, budget=budget,
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)
@@ -234,22 +266,34 @@ def register_commands(bot: "DevinMobileBot") -> None:
 
     @tree.command(name="schedule", description="Run a prompt on a recurring interval")
     @app_commands.describe(
-        prompt="What Devin should do each run",
         every="Interval: 30m, 6h, 1d, …",
+        prompt="What Devin should do each run (or pick a recipe)",
+        recipe="Canned task — dep-audit, test-coverage, security-scan",
         repo="org/repo (comma-separate for several)",
         model="Model picker (optional)",
+    )
+    @app_commands.choices(
+        recipe=[app_commands.Choice(name=k, value=k) for k in RECIPES]
     )
     @app_commands.autocomplete(model=model_autocomplete, repo=repo_autocomplete)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def schedule_cmd(
         interaction: discord.Interaction,
-        prompt: str,
         every: str,
+        prompt: str | None = None,
+        recipe: str | None = None,
         repo: str | None = None,
         model: str | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if recipe:
+            prompt = f"{RECIPES[recipe]}\n\n{prompt}" if prompt else RECIPES[recipe]
+        if not prompt:
+            await interaction.response.send_message(
+                "Give a `prompt:` or pick a `recipe:`.", ephemeral=True
+            )
             return
         interval = parse_every(every)
         if interval is None or interval < 300:
@@ -271,6 +315,71 @@ def register_commands(bot: "DevinMobileBot") -> None:
             f"`{prompt[:80]}` on {', '.join(row.repos) or 'default repos'}",
             ephemeral=True,
         )
+
+    @tree.command(
+        name="continue",
+        description="Continue this session's work in a fresh session",
+    )
+    @app_commands.describe(notes="Extra instructions for the continuation")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def continue_cmd(
+        interaction: discord.Interaction, notes: str | None = None
+    ) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "Run /continue inside a session thread.", ephemeral=True
+            )
+            return
+        binding = await bot.db.get_binding_by_thread(interaction.channel.id)
+        if binding is None:
+            await interaction.response.send_message(
+                "This thread isn't bound to a session.", ephemeral=True
+            )
+            return
+        if binding.status not in {"exit", "error", "suspended"}:
+            await interaction.response.send_message(
+                "Session is still active — reply here to steer it "
+                "(or /kill first).", ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        sess = None
+        try:
+            sess = await bot.devin.get_session(binding.session_id)
+        except Exception:  # noqa: BLE001 — last_msg is the fallback
+            log.info("continue: get_session failed for %s", binding.session_id)
+        so = (sess.structured_output if sess else None) or {}
+        prompt = (
+            "Continue the work from a previous Devin session "
+            f"({binding.url or binding.session_id}).\n"
+            f"Summary so far: "
+            f"{so.get('summary') or binding.last_msg or '(none captured)'}\n"
+        )
+        if so.get("files_changed"):
+            prompt += f"Files touched: {', '.join(so['files_changed'][:20])}\n"
+        if notes:
+            prompt += f"\nAdditional instructions: {notes}\n"
+        prompt += "\nInspect the repo state first, then carry the task forward."
+        try:
+            _, thread = await spawn_session(
+                bot,
+                prompt=prompt,
+                repos=binding.repos.split(",") if binding.repos else None,
+                model=binding.model or None,
+                title=f"{binding.title or 'session'} (cont.)",
+                continued_from=binding.session_id,
+                budget=binding.max_acu,
+            )
+        except SpawnError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"Continuation spawned → {thread.mention}", ephemeral=True
+        )
+        await interaction.channel.send(f"↪️ Continued in {thread.mention}")
 
     @tree.command(name="schedules", description="List recurring Devin tasks")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)

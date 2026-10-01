@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS bindings (
     last_activity_at INTEGER,
     quiet_alerted  INTEGER NOT NULL DEFAULT 0,
     repos          TEXT,
+    continued_from TEXT,
+    max_acu        REAL,
+    review_of      TEXT,
     created_at     INTEGER NOT NULL
 );
 
@@ -81,6 +84,14 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         # comma-joined canonical owner/repo list — powers /usage per-repo
         # rollup; backfilled from prs where a session produced one
         "repos": "ALTER TABLE bindings ADD COLUMN repos TEXT",
+        # session id this one continues from — set at spawn; a non-empty
+        # value also caps auto-respawn chains at depth 1
+        "continued_from": "ALTER TABLE bindings ADD COLUMN continued_from TEXT",
+        # per-task ACU cap from /devin budget: (NULL = follow global)
+        "max_acu": "ALTER TABLE bindings ADD COLUMN max_acu REAL",
+        # "owner/repo#n" this session was spawned to review — marks it for
+        # the Post-to-GitHub button on completion + dedupes label events
+        "review_of": "ALTER TABLE bindings ADD COLUMN review_of TEXT",
     },
     "prs": {
         "auto_merge": (
@@ -142,6 +153,9 @@ class Binding:
     last_activity_at: int = 0  # watchdog anchor; 0 = fall back to created_at
     quiet_alerted: bool = False
     repos: str = ""  # comma-joined canonical owner/repo, set at spawn
+    continued_from: str = ""  # parent session id for respawned/continued
+    max_acu: float | None = None  # per-task cap; None = follow global
+    review_of: str = ""  # "owner/repo#n" when spawned by the review label
     created_at: int = 0
 
 
@@ -199,6 +213,14 @@ class Database:
             last_activity_at=row["last_activity_at"] or 0,
             quiet_alerted=bool(row["quiet_alerted"]),
             repos=(row["repos"] or "") if "repos" in row.keys() else "",
+            continued_from=(
+                (row["continued_from"] or "")
+                if "continued_from" in row.keys() else ""
+            ),
+            max_acu=row["max_acu"] if "max_acu" in row.keys() else None,
+            review_of=(
+                (row["review_of"] or "") if "review_of" in row.keys() else ""
+            ),
             created_at=row["created_at"] or 0,
         )
 
@@ -210,8 +232,8 @@ class Database:
                (session_id, thread_id, channel_id, anchor_msg_id, title, url,
                 status, status_detail, msg_cursor, seen_event_ids, active, model,
                 last_msg, acus, acu_warned, last_activity_at, quiet_alerted,
-                repos, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                repos, continued_from, max_acu, review_of, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
@@ -224,7 +246,12 @@ class Database:
                  quiet_alerted=excluded.quiet_alerted,
                  -- a state-only upsert (repos="") must not wipe the
                  -- spawn-time repo attribution
-                 repos=COALESCE(NULLIF(excluded.repos, ''), bindings.repos)""",
+                 repos=COALESCE(NULLIF(excluded.repos, ''), bindings.repos),
+                 continued_from=COALESCE(NULLIF(excluded.continued_from, ''),
+                                         bindings.continued_from),
+                 max_acu=COALESCE(excluded.max_acu, bindings.max_acu),
+                 review_of=COALESCE(NULLIF(excluded.review_of, ''),
+                                    bindings.review_of)""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
@@ -233,7 +260,8 @@ class Database:
                 json.dumps(b.seen_event_ids[-SEEN_CAP:]),
                 int(b.active), b.model, b.last_msg, b.acus, b.acu_warned,
                 b.last_activity_at or None, int(b.quiet_alerted),
-                b.repos or None, b.created_at,
+                b.repos or None, b.continued_from or None, b.max_acu,
+                b.review_of or None, b.created_at,
             ),
         )
         await self._conn.commit()
@@ -349,6 +377,14 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return self._row_to_pr(row) if row else None
+
+    async def binding_by_review_of(self, review_of: str) -> Binding | None:
+        """Dedupe review-label spawns — one review session per PR."""
+        async with self._conn.execute(
+            "SELECT * FROM bindings WHERE review_of = ? LIMIT 1", (review_of,)
+        ) as cur:
+            row = await cur.fetchone()
+        return self._row_to_binding(row) if row else None
 
     async def binding_for_pr(
         self, owner: str, repo: str, number: int

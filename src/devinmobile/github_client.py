@@ -334,6 +334,16 @@ class GithubClient:
             json={"event": "APPROVE"},
         )
 
+    async def create_pr_review(self, pr: PullRef, body: str) -> dict[str, Any]:
+        """COMMENT review — findings without a verdict. Deliberately never
+        APPROVE/REQUEST_CHANGES from the bot: a human taps Approve on the
+        card if the review is clean."""
+        return await self._req(
+            "POST",
+            f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews",
+            json={"event": "COMMENT", "body": body},
+        )
+
     # ---- issues -----------------------------------------------------------
 
     async def get_issue(self, owner: str, repo: str, number: int) -> dict[str, Any]:
