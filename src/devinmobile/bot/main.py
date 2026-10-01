@@ -28,7 +28,7 @@ class DevinMobileBot(discord.Client):
         self.db: Database
         self.devin: DevinClient
         self.bridge: AcpBridge
-        self.github: GithubClient | None
+        self.github: GithubClient | None = None
         self.relay: Relay
         self._relay_task: asyncio.Task | None = None
         self._webhook: WebhookServer | None = None
