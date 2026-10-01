@@ -33,7 +33,7 @@ def test_chunk_hard_cut_no_newlines():
 
 
 def test_relayable_filters_user_and_dedupes():
-    seen = {"e0"}
+    seen = ["e0"]
     items = [
         make_msg("e0", "devin"),          # already seen
         make_msg("e1", "user"),           # our own forwarded message
@@ -42,7 +42,7 @@ def test_relayable_filters_user_and_dedupes():
     ]
     out = relayable(items, seen)
     assert [m.event_id for m in out] == ["e2", "e3"]
-    assert seen == {"e0", "e1", "e2", "e3"}
+    assert seen == ["e0", "e1", "e2", "e3"]  # insertion-ordered
 
 
 def test_transition_exit_notifies_complete():

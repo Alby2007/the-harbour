@@ -76,8 +76,10 @@ def test_checks_state_rollup():
 
 
 def test_pr_custom_id_roundtrip():
-    cid = make_custom_id("pr_merge", "devin-abc", "42")
-    assert parse_custom_id(cid) == ("pr_merge", "devin-abc", "42")
+    # extra carries full PR identity (owner/repo#n) — multi-repo sessions
+    # can't act on the wrong repo's same-numbered PR
+    cid = make_custom_id("pr_merge", "devin-abc", "o/r#42")
+    assert parse_custom_id(cid) == ("pr_merge", "devin-abc", "o/r#42")
     cid = make_custom_id("refresh", "devin-abc")
     assert parse_custom_id(cid) == ("refresh", "devin-abc", None)
     # foreign/legacy ids are ignored
@@ -168,10 +170,18 @@ async def test_pr_roundtrip_and_join(tmp_path):
     row = await db.get_pr("s1", url)
     assert row.state == "merged" and row.card_msg_id == 777
 
-    assert (await db.get_pr_by_number("s1", 5)).pr_url == url
+    assert (await db.get_pr_by_ref("s1", "O", "R", 5)).pr_url == url  # case-insensitive
     assert [p.number for p in await db.prs_for_session("s1")] == [5]
 
-    found = await db.binding_for_pr("o", "r", 5)
+    # multi-repo session: same PR number in a second repo resolves separately
+    await db.upsert_pr(PrRow(
+        session_id="s1", pr_url="https://github.com/o/OTHER/pull/5",
+        owner="o", repo="OTHER", number=5, state="open",
+    ))
+    other = await db.get_pr_by_ref("s1", "o", "other", 5)
+    assert other and other.pr_url.endswith("/OTHER/pull/5")
+
+    found = await db.binding_for_pr("O", "R", 5)  # webhook payload casing
     assert found is not None
     binding, pr = found
     assert binding.session_id == "s1" and binding.thread_id == 10
@@ -231,7 +241,7 @@ async def test_webhook_pull_request_event(tmp_path):
         "pull_request": {"number": 5, "merged": True, "state": "closed",
                          "title": "My PR"},
     })
-    row = await db.get_pr_by_number("s1", 5)
+    row = await db.get_pr_by_ref("s1", "o", "r", 5)
     assert row.state == "merged" and row.pr_title == "My PR"
     assert any("merged" in m for m in thread.sent)
 
@@ -240,7 +250,7 @@ async def test_webhook_pull_request_event(tmp_path):
         "repository": {"name": "r", "owner": {"login": "o"}},
         "pull_request": {"number": 999, "state": "open"},
     })
-    assert await db.get_pr_by_number("s1", 999) is None
+    assert await db.get_pr_by_ref("s1", "o", "r", 999) is None
     await db.close()
 
 

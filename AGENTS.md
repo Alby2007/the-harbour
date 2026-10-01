@@ -58,9 +58,16 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   failure beats in-progress; skipped/neutral don't block success.
 - `db.py` `prs` table — `(session_id, pr_url)` PK; `card_msg_id` (the posted
   card), `last_notified` (`"{state}|{checks}"` — notify once per distinct
-  outcome), `binding_for_pr` joins back for webhook routing. Upsert is
-  state-tolerant: NULLIF/CASE guards keep a state-only update from wiping
-  owner/repo/number.
+  outcome), `binding_for_pr`/`get_pr_by_ref` are case-insensitive
+  (owner/repo compare via `lower()` — URL casing vs webhook `login` casing
+  can differ). Upsert is state-tolerant: NULLIF/CASE guards keep a
+  state-only update from wiping owner/repo/number. PR button custom_ids
+  carry `owner/repo#n` in `extra` — bare numbers collide across repos in a
+  multi-repo session. `seen_event_ids` is an insertion-ordered *list* —
+  the 500-cap evicts oldest-first (uuid event ids don't sort by time;
+  sorted() eviction caused reposts). `bindings.last_msg` persists the last
+  Devin message so `waiting_for_user`'s question detection works when the
+  message and the status flip land in different poll ticks.
 - `relay.py` PR path — `_sync_prs` runs inside `poll_binding`: discovers
   `session.pull_requests` (v3 field), posts one card per new PR
   (`_post_pr_card`), then `_poll_pr` diffs `(state, checks)` against

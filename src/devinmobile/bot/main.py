@@ -9,7 +9,7 @@ from ..config import Settings
 from ..db import Database
 from ..devin_client import DevinClient
 from ..embeds import status_embed
-from ..github_client import GithubClient, PullRef
+from ..github_client import GithubClient, PullRef, parse_issue_ref
 from ..relay import Relay
 from ..views import MergeConfirmView, dispatch
 from ..webhook_server import WebhookServer, maybe_start
@@ -93,6 +93,8 @@ class DevinMobileBot(discord.Client):
     async def close(self) -> None:
         if self._relay_task:
             self._relay_task.cancel()
+        if self.relay:
+            await self.relay.aclose()
         if self.db:
             await self.db.close()
         if self.devin:
@@ -121,10 +123,13 @@ class DevinMobileBot(discord.Client):
                 attachment_urls=[a.url for a in message.attachments] or None,
                 message_as_user_id=self.settings.create_as_user_id,
             )
-            binding.status = session.status
-            binding.status_detail = session.status_detail
-            binding.active = True
-            await self.db.upsert_binding(binding)
+            # Same lock as the poll loop — an in-flight poll can't overwrite
+            # this reactivation with a stale parked status.
+            async with self.relay._lock(binding.session_id):
+                binding.status = session.status
+                binding.status_detail = session.status_detail
+                binding.active = True
+                await self.db.upsert_binding(binding)
             await message.add_reaction("\u2705")
             # Devin's ack typically lands within seconds — don't make the
             # reply wait for the next scheduled tick.
@@ -167,7 +172,11 @@ class DevinMobileBot(discord.Client):
             )
         elif action == "refresh":
             await interaction.response.defer()
-            session = await self.devin.get_session(session_id)
+            try:
+                session = await self.devin.get_session(session_id)
+            except Exception as e:  # noqa: BLE001 — surface the API error
+                await interaction.followup.send(f"Refresh failed: `{e}`", ephemeral=True)
+                return
             if interaction.message:
                 await interaction.message.edit(
                     embed=status_embed(
@@ -180,11 +189,15 @@ class DevinMobileBot(discord.Client):
                 await self.db.upsert_binding(binding)
         elif action == "approve":
             await interaction.response.defer(ephemeral=True)
-            await self.devin.send_message(
-                session_id,
-                "Approved — please proceed.",
-                message_as_user_id=self.settings.create_as_user_id,
-            )
+            try:
+                await self.devin.send_message(
+                    session_id,
+                    "Approved — please proceed.",
+                    message_as_user_id=self.settings.create_as_user_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                await interaction.followup.send(f"Approve failed: `{e}`", ephemeral=True)
+                return
             await interaction.followup.send("Sent an approval to the session.", ephemeral=True)
 
     async def _handle_pr_action(
@@ -192,17 +205,24 @@ class DevinMobileBot(discord.Client):
         interaction: discord.Interaction,
         action: str,
         session_id: str,
-        pr_number: str | None,
+        pr_key: str | None,
     ) -> None:
-        if self.github is None or not pr_number:
+        if self.github is None or not pr_key:
             await interaction.response.send_message(
                 "GitHub App isn't configured (GITHUB_APP_*).", ephemeral=True
             )
             return
-        row = await self.db.get_pr_by_number(session_id, int(pr_number))
+        ref_parsed = parse_issue_ref(pr_key)
+        if ref_parsed is None:
+            await interaction.response.send_message(
+                f"Bad PR reference {pr_key!r}.", ephemeral=True
+            )
+            return
+        o, r, n = ref_parsed
+        row = await self.db.get_pr_by_ref(session_id, o, r, n)
         if row is None:
             await interaction.response.send_message(
-                f"No PR #{pr_number} tracked for this session.", ephemeral=True
+                f"No PR {pr_key} tracked for this session.", ephemeral=True
             )
             return
         ref = PullRef(owner=row.owner, repo=row.repo, number=row.number)
@@ -213,7 +233,7 @@ class DevinMobileBot(discord.Client):
             await interaction.response.send_message(
                 f"Merge **{row.pr_title or row.pr_url}** "
                 f"({self.settings.github_merge_method})?",
-                view=MergeConfirmView(session_id, row.number, self.handle_component),
+                view=MergeConfirmView(session_id, pr_key, self.handle_component),
                 ephemeral=True,
             )
             return

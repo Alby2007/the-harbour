@@ -77,7 +77,7 @@ class Binding:
     status: str | None = None
     status_detail: str | None = None
     msg_cursor: str | None = None
-    seen_event_ids: set[str] = field(default_factory=set)
+    seen_event_ids: list[str] = field(default_factory=list)  # insertion-ordered
     active: bool = True
     model: str | None = None
     last_msg: str | None = None  # most recent Devin message text (for ?-detection)
@@ -116,7 +116,7 @@ class Database:
             status=row["status"],
             status_detail=row["status_detail"],
             msg_cursor=row["msg_cursor"],
-            seen_event_ids=set(json.loads(row["seen_event_ids"])),
+            seen_event_ids=list(json.loads(row["seen_event_ids"])),
             active=bool(row["active"]),
             model=row["model"] if "model" in row.keys() else None,
             last_msg=row["last_msg"] if "last_msg" in row.keys() else None,
@@ -142,7 +142,9 @@ class Database:
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
-                json.dumps(sorted(b.seen_event_ids)[-SEEN_CAP:]),
+                # insertion order — evict the OLDEST ids, not the
+                # lexicographically smallest (uuid ids don't sort by time)
+                json.dumps(b.seen_event_ids[-SEEN_CAP:]),
                 int(b.active), b.model, b.last_msg, b.created_at,
             ),
         )
@@ -228,12 +230,16 @@ class Database:
         ) as cur:
             return [self._row_to_pr(r) for r in await cur.fetchall()]
 
-    async def get_pr_by_number(
-        self, session_id: str, number: int
+    async def get_pr_by_ref(
+        self, session_id: str, owner: str, repo: str, number: int
     ) -> PrRow | None:
+        """Find a tracked PR by identity — case-insensitive owner/repo so a
+        differently-cased URL or webhook payload still matches."""
         async with self._conn.execute(
-            "SELECT * FROM prs WHERE session_id = ? AND number = ?",
-            (session_id, number),
+            """SELECT * FROM prs WHERE session_id = ?
+                 AND lower(owner) = lower(?) AND lower(repo) = lower(?)
+                 AND number = ?""",
+            (session_id, owner, repo, number),
         ) as cur:
             row = await cur.fetchone()
         return self._row_to_pr(row) if row else None
@@ -245,7 +251,8 @@ class Database:
         async with self._conn.execute(
             """SELECT b.*, p.* FROM prs p JOIN bindings b
                  ON b.session_id = p.session_id
-               WHERE p.owner = ? AND p.repo = ? AND p.number = ?""",
+               WHERE lower(p.owner) = lower(?) AND lower(p.repo) = lower(?)
+                 AND p.number = ?""",
             (owner, repo, number),
         ) as cur:
             row = await cur.fetchone()

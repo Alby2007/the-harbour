@@ -224,8 +224,13 @@ class AcpBridge:
             if self._session is not None:
                 ws = await self._session.ws_connect(ws_url)
             else:
-                self._owned_session = aiohttp.ClientSession()
-                ws = await self._owned_session.ws_connect(ws_url)
+                owned = aiohttp.ClientSession()
+                try:
+                    ws = await owned.ws_connect(ws_url)
+                except BaseException:
+                    await owned.close()  # no leak on handshake failure
+                    raise
+                self._owned_session = owned
         except aiohttp.WSServerHandshakeError as e:
             raise BridgeError(
                 f"bridge rejected auth ({e.status}) — re-run `devin auth login`"

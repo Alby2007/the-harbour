@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
 
-from ..acp_bridge import MODEL_ALIASES, BridgeError
+from ..acp_bridge import MODEL_ALIASES, BridgeError, ConfigOption, resolve_option
 from ..db import Binding
 from ..devin_client import SESSION_TAG
 from ..embeds import status_embed
@@ -125,6 +125,28 @@ def register_commands(bot: "DevinMobileBot") -> None:
             )
             return
         await interaction.response.defer()
+
+        if repos and bot.bridge.available:
+            # Canonicalize against the live catalog even on the v3 path —
+            # v3 silently drops repo values it doesn't recognize, same trap
+            # as the bridge. Bridge off → pass raw (nothing to check against).
+            # (Post-defer: a cold catalog() call can exceed the 3s window.)
+            try:
+                cat = await bot.bridge.catalog()
+                repo_opts = [
+                    ConfigOption(name=o.get("name", ""), value=o.get("value", ""))
+                    for o in (cat.get("repos", {}).get("options") or [])
+                ]
+                if repo_opts:
+                    repos = [
+                        resolve_option(r, repo_opts, what="repo").value
+                        for r in repos
+                    ]
+            except BridgeError as e:
+                await interaction.followup.send(f"`{e}`", ephemeral=True)
+                return
+            except Exception:  # noqa: BLE001 — catalog fetch failed; pass raw
+                pass
 
         if issue:
             default_repo = repos[0] if repos else None

@@ -108,14 +108,18 @@ class WebhookServer:
             if found is None:
                 continue
             binding, row = found
-            # A single completed run isn't the aggregate — let the poll
-            # reconcile; we only post the completion event.
-            conclusion = runs.get("conclusion") or runs.get("status") or "?"
+            # Only failure-ish conclusions post — a chatty CI could otherwise
+            # spam the thread once per completed run. Success transitions
+            # arrive via the poll's CI-rollup diff instead.
+            conclusion = runs.get("conclusion") or ""
+            if conclusion not in ("failure", "timed_out", "action_required",
+                                  "cancelled"):
+                continue
             name = runs.get("name") or "check"
             await self._post(
                 binding,
                 f"Check `{name}` on PR #{row.number}: **{conclusion}**",
-                mention=conclusion in ("failure", "timed_out", "action_required"),
+                mention=True,
             )
 
     async def _apply(

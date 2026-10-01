@@ -55,12 +55,16 @@ def extract_attachments(text: str) -> tuple[str, list[str]]:
     return ATTACHMENT_RE.sub(repl, text).strip(), urls
 
 
-def relayable(items: list[SessionMessage], seen: set[str]) -> list[SessionMessage]:
+def relayable(items: list[SessionMessage], seen: list[str]) -> list[SessionMessage]:
+    """Filter to new Devin messages; `seen` is an insertion-ordered id list
+    (membership via a scratch set, order preserved for FIFO eviction)."""
+    have = set(seen)
     out = []
     for m in items:
-        if m.event_id in seen:
+        if m.event_id in have:
             continue
-        seen.add(m.event_id)
+        have.add(m.event_id)
+        seen.append(m.event_id)
         if m.source == "devin":
             out.append(m)
     return out
@@ -137,20 +141,33 @@ class Relay:
         self.github = github
         self._component_handler = component_handler
         self._locks: dict[str, asyncio.Lock] = {}
+        self._repoll: set[str] = set()  # sessions needing one more pass
+        self._tasks: set[asyncio.Task] = set()
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._locks.setdefault(session_id, asyncio.Lock())
 
     def request_poll(self, binding: Binding) -> None:
         """Schedule an out-of-band poll for one binding — used right after
-        we send Devin a message so the reply doesn't wait for the tick."""
-        async def _poll() -> None:
-            try:
-                await self.poll_binding(binding)
-            except Exception:
-                log.exception("on-demand poll failed for %s", binding.session_id)
+        we send Devin a message so the reply doesn't wait for the tick.
+        Requests arriving while a poll is in flight coalesce into a single
+        re-poll instead of queueing unbounded tasks."""
+        if self._lock(binding.session_id).locked():
+            self._repoll.add(binding.session_id)
+            return
+        task = asyncio.create_task(self._safe_poll(binding))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
-        asyncio.create_task(_poll())
+    async def _safe_poll(self, binding: Binding) -> None:
+        try:
+            await self.poll_binding(binding)
+        except Exception:
+            log.exception("on-demand poll failed for %s", binding.session_id)
+
+    async def aclose(self) -> None:
+        for t in self._tasks:
+            t.cancel()
 
     async def run_forever(self) -> None:
         while True:
@@ -167,6 +184,10 @@ class Relay:
     async def poll_binding(self, binding: Binding) -> None:
         async with self._lock(binding.session_id):
             await self._poll(binding)
+            # requests that landed while we polled get exactly one extra pass
+            while binding.session_id in self._repoll:
+                self._repoll.discard(binding.session_id)
+                await self._poll(binding)
 
     async def _poll(self, binding: Binding) -> None:
         cursor = binding.msg_cursor
@@ -201,8 +222,9 @@ class Relay:
         await self._update_anchor(binding, session, complete=is_complete)
         if notif:
             await self._notify(binding, session, notif)
-        if session.status in QUIET_STATUSES:
-            binding.active = False
+        # Derived from the live status so a stale write can't strand a
+        # reactivated thread in the parked state.
+        binding.active = session.status not in QUIET_STATUSES
         await self.db.upsert_binding(binding)
 
     # Statuses that mean "Devin is actively working right now". waiting_for_*
@@ -229,6 +251,8 @@ class Relay:
     async def _sync_prs(self, binding: Binding, session: Session) -> None:
         """Discover PRs from the v3 session payload; post a card once per PR,
         then poll state/CI each tick for notification transitions."""
+        if self.github is None:
+            return  # no app → no cards; PR links still show in the anchor embed
         for pr in session.pull_requests:
             row = await self.db.get_pr(binding.session_id, pr.pr_url)
             ref = parse_pr_url(pr.pr_url)
@@ -270,7 +294,8 @@ class Relay:
                 checks=row.checks_state, url=row.pr_url,
             ),
             view=(
-                PRView(binding.session_id, row.number, row.pr_url,
+                PRView(binding.session_id,
+                       f"{row.owner}/{row.repo}#{row.number}", row.pr_url,
                        self._component_handler)
                 if self._component_handler
                 else discord.utils.MISSING
@@ -300,9 +325,9 @@ class Relay:
             mention = " ".join(
                 f"<@{u}>" for u in self.settings.allowed_user_id_set
             )
-            label = f"PR #{row.number}"
+            label = f"{row.repo}#{row.number}" if row.repo else f"PR #{row.number}"
             if state == "merged":
-                await thread.send(f"{label} merged 🟣")
+                await thread.send(f"{mention} {label} merged 🟣")
             elif state == "closed" and row.state != "closed":
                 await thread.send(f"{label} closed.")
             elif checks == "success" and row.checks_state != "success":

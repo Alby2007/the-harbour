@@ -9,6 +9,11 @@ services:
       # Optional: mount CLI credentials for the `model:` option (ACP bridge).
       # Create on the host with `devin auth login`, then uncomment:
       # - ${HOME}/.local/share/devin/credentials.toml:/home/app/.local/share/devin/credentials.toml:ro
+      # Optional: GitHub App private key for PR cards/actions + `issue:`:
+      # - ./github-app.pem:/app/github-app.pem:ro
+    # Optional: expose the GitHub webhook receiver (GITHUB_WEBHOOK_PORT):
+    # ports:
+    #   - "8977:8977"
     restart: unless-stopped
 
 volumes:

@@ -13,14 +13,14 @@ async def test_roundtrip(tmp_path):
         status="running",
         status_detail="working",
         msg_cursor="cur",
-        seen_event_ids={"e1", "e2"},
+        seen_event_ids=["e1", "e2"],
     )
     await db.upsert_binding(b)
 
     by_thread = await db.get_binding_by_thread(111)
     assert by_thread is not None
     assert by_thread.session_id == "devin-1"
-    assert by_thread.seen_event_ids == {"e1", "e2"}
+    assert by_thread.seen_event_ids == ["e1", "e2"]
 
     by_sid = await db.get_binding("devin-1")
     assert by_sid is not None and by_sid.active

@@ -70,8 +70,10 @@ class PRView(discord.ui.View):
     """
 
     def __init__(
-        self, session_id: str, pr_number: int, pr_url: str, handler: ComponentHandler
+        self, session_id: str, pr_key: str, pr_url: str, handler: ComponentHandler
     ) -> None:
+        """pr_key is `owner/repo#number` — carries full PR identity so a
+        multi-repo session can't act on the wrong repo's same-numbered PR."""
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(
             style=discord.ButtonStyle.link, label="Open on GitHub", url=pr_url,
@@ -83,7 +85,7 @@ class PRView(discord.ui.View):
         ):
             self.add_item(_CbButton(
                 label=label,
-                custom_id=make_custom_id(action, session_id, str(pr_number)),
+                custom_id=make_custom_id(action, session_id, pr_key),
                 handler=handler,
                 style=style,
             ))
@@ -93,12 +95,12 @@ class MergeConfirmView(discord.ui.View):
     """Ephemeral confirm for PR merges."""
 
     def __init__(
-        self, session_id: str, pr_number: int, handler: ComponentHandler
+        self, session_id: str, pr_key: str, handler: ComponentHandler
     ) -> None:
         super().__init__(timeout=60)
         btn = _CbButton(
             label="Confirm merge",
-            custom_id=make_custom_id("pr_merge_go", session_id, str(pr_number)),
+            custom_id=make_custom_id("pr_merge_go", session_id, pr_key),
             handler=handler,
         )
         btn.style = discord.ButtonStyle.danger
