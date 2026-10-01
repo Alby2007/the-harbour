@@ -166,6 +166,10 @@ class DevinMobileBot(discord.Client):
                 binding.active = True
                 await self.db.upsert_binding(binding)
             await message.add_reaction("\u2705")
+            # Placeholder covers the send→first-output dead air; it morphs
+            # into the Working list on the first streamed tool call and is
+            # deleted when the reply lands.
+            await self.relay.progress.thinking(binding)
             # Devin's ack typically lands within seconds — don't make the
             # reply wait for the next scheduled tick.
             self.relay.request_poll(binding)

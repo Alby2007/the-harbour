@@ -48,6 +48,9 @@ def summarize_update(update: dict[str, Any]) -> str | None:
     return None
 
 
+THINKING_TEXT = "⏳ *Devin is thinking…*"
+
+
 @dataclass
 class _Stream:
     msg_id: int | None = None
@@ -61,6 +64,24 @@ class ProgressTracker:
     def __init__(self, get_thread: GetThread) -> None:
         self._get_thread = get_thread
         self._streams: dict[str, _Stream] = {}
+
+    async def thinking(self, binding: Binding) -> None:
+        """Post the pre-work placeholder right after a user send — covers the
+        send→first-tool-call dead air. The first push() morphs it into the
+        Working list; a relayed reply or turn end deletes it."""
+        st = self._streams.setdefault(binding.session_id, _Stream())
+        if st.lines:
+            return  # already mid-turn — the Working display is showing
+        st.dirty = True
+        await self._flush(binding, st)
+
+    async def clear_thinking(self, binding: Binding) -> None:
+        """A real Devin chat message arrived — drop the placeholder, but only
+        if no tool lines have streamed yet (mid-turn relayed messages must
+        not kill an active Working list)."""
+        st = self._streams.get(binding.session_id)
+        if st is not None and not st.lines:
+            await self.done(binding)
 
     async def push(self, binding: Binding, line: str) -> None:
         st = self._streams.setdefault(binding.session_id, _Stream())
@@ -88,7 +109,9 @@ class ProgressTracker:
         thread = await self._get_thread(binding)
         if thread is None:
             return
-        text = "**Working…**\n" + "\n".join(st.lines)
+        text = (
+            "**Working…**\n" + "\n".join(st.lines) if st.lines else THINKING_TEXT
+        )
         try:
             if st.msg_id is None:
                 msg = await thread.send(text)

@@ -142,6 +142,9 @@ async def spawn_session(
         last_activity_at=int(time.time()),
     )
     await bot.db.upsert_binding(binding)
+    # Cover the create→first-ack gap (measured ~5s) with the thinking
+    # placeholder; it morphs into the live Working display on first tool call.
+    await bot.relay.progress.thinking(binding)
     # Devin's first ack lands within seconds — poll immediately instead of
     # waiting for the first scheduled tick.
     bot.relay.request_poll(binding)

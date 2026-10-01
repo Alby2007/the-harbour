@@ -481,6 +481,9 @@ class Relay:
         if thread is None:
             log.warning("no thread %s for %s", binding.thread_id, binding.session_id)
             return
+        # The real reply is arriving — a bare "thinking…" placeholder is
+        # obsolete (a populated Working list survives mid-turn chat messages)
+        await self.progress.clear_thinking(binding)
         text, attachments = extract_attachments(m.message or "")
         chunks = chunk_text(text) if text else []
         for i, chunk in enumerate(chunks[:8]):

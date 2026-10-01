@@ -74,3 +74,38 @@ async def test_consecutive_dupe_lines_dropped():
     await tracker.push(b, "`x`")
     st = tracker._streams["s2"]
     assert list(st.lines) == ["`x`"]
+
+
+async def test_thinking_placeholder_morphs_and_clears():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="s3", thread_id=1, channel_id=1)
+
+    await tracker.thinking(b)
+    assert len(thread.messages) == 1
+    msg = next(iter(thread.messages.values()))
+
+    # thinking is idempotent while idle — same message, no repost
+    await tracker.thinking(b)
+    assert len(thread.messages) == 1
+
+    # first tool call morphs the placeholder into the Working list
+    await tracker.push(b, "`ls -la`")
+    assert len(thread.messages) == 1
+    assert msg.edits and "Working" in msg.edits[-1]
+
+    # a relayed Devin message must NOT clear an active Working list
+    await tracker.clear_thinking(b)
+    assert not msg.deleted
+    await tracker.done(b)
+    assert msg.deleted
+
+
+async def test_thinking_cleared_by_first_reply():
+    thread = _Thread()
+    tracker = ProgressTracker(lambda b: asyncio.sleep(0, thread))
+    b = Binding(session_id="s4", thread_id=1, channel_id=1)
+    await tracker.thinking(b)
+    msg = next(iter(thread.messages.values()))
+    await tracker.clear_thinking(b)  # reply landed before any tool call
+    assert msg.deleted
