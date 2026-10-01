@@ -137,3 +137,21 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
 - Voice steering: `message.attachments` with `audio/*` (or `.waveform`)
   transcribe via Whisper when `OPENAI_API_KEY` is set; the transcript
   echoes as a quote so the user sees what Devin got.
+- `bindings.continued_from` marks respawn/`/continue` children — the
+  respawn guard is "child doesn't respawn", capping chains at depth 1.
+  `bindings.max_acu` overrides the global cap for `_check_acu` pings and
+  parks the binding at 100% (it enforces bridge sessions bot-side too,
+  where v3's `max_acu_limit` can't reach — derived-active must be computed
+  BEFORE `_check_acu` or the same tick un-parks it). `bindings.review_of`
+  dedupes `devin-review` label spawns and puts a Post-review button on the
+  completion card (COMMENT reviews only — never APPROVE).
+- `Relay._presence` writes bot status only when the active-binding count
+  changes, skips until `is_ready()` (the first tick can precede the ws),
+  and clears at zero — all failures are swallowed, it's cosmetic.
+- Snapshot warm-start: probed (`scripts/probe_snapshots.py`) — `session/new`
+  has no blueprint select and there are no update/save methods; blueprints
+  auto-apply per repo so there's nothing left to build.
+- Test fixture leak: `Database.connect`'s aiosqlite worker thread is
+  non-daemon — tests that skip `db.close()` leave pytest unable to exit
+  (zombie processes accumulate). `tests/conftest.py` auto-closes every
+  opened connection; keep new tests inside that convention.

@@ -25,8 +25,9 @@ first — so `prompt` always leads; `model` is the first optional chip.
 
 `model:` sessions are created over the ACP bridge as *your* Devin user (see
 [setup](setup.md#3-devin-cli-login-model-selection)); they don't get
-`tags`, `structured_output_schema`, or `MAX_ACU_LIMIT` — those only exist on
-the plain v3 path.
+`tags`, `structured_output_schema`, or server-side `MAX_ACU_LIMIT` — those
+only exist on the plain v3 path. `budget:` still works on bridge sessions —
+the bot parks the binding when burn crosses it.
 
 ### `/devin-all`
 

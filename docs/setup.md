@@ -82,8 +82,10 @@ the cards + pings on transitions, and `/devin issue:` intake.
    - **Repository permissions**: *Pull requests: Read & write*, *Contents:
      Read & write* (merge needs it), *Issues: Read-only*, *Checks:
      Read-only*.
-   - **Subscribe to events**: `pull_request`, `check_run`, `check_suite`
-     (only needed if you also want the webhook receiver below).
+   - **Subscribe to events**: `pull_request`, `pull_request_review`,
+     `pull_request_review_comment`, `check_run`, `check_suite`, `issues`
+     (only needed if you also want the webhook receiver below — the labels
+     ride `pull_request`/`issues` `labeled` actions).
 2. **Generate a private key** → save the `.pem` next to the bot →
    `GITHUB_APP_PRIVATE_KEY_PATH`.
 3. App page → App ID → `GITHUB_APP_ID`.
@@ -93,7 +95,9 @@ the cards + pings on transitions, and `/devin issue:` intake.
 5. Optional instant transitions: set a **webhook** on the app pointing at
    `https://<your-host-or-tunnel>/github` with a shared secret →
    `GITHUB_WEBHOOK_SECRET` (+ `GITHUB_WEBHOOK_PORT`, default 8977). The bot
-   verifies `X-Hub-Signature-256` and only processes PRs it already tracks.
+   verifies `X-Hub-Signature-256`. Tracked PRs get instant transitions;
+   untracked ones are ignored except `devin`/`devin-review` labels, which
+   spawn sessions.
    Behind NAT, a `cloudflared`/`ngrok` tunnel to the port works fine.
 
 Devin's own GitHub connection is unaffected — sessions clone and open PRs
@@ -127,6 +131,13 @@ cp .env.example .env
 | `GITHUB_MERGE_METHOD` | no | `squash` (default) / `merge` / `rebase` |
 | `GITHUB_WEBHOOK_SECRET` | no | Enables the `/github` webhook receiver |
 | `GITHUB_WEBHOOK_PORT` | no | Webhook listen port (default 8977) |
+| `GITHUB_TRIGGER_LABEL` | no | Issue label that spawns a session (default `devin`) |
+| `GITHUB_REVIEW_LABEL` | no | PR label that spawns a review session (default `devin-review`) |
+| `DEVIN_DEFAULT_MODEL` | no | Route every `/devin` through the bridge model unless `model:`/`mode:` is given |
+| `ACP_PROGRESS` | no | Live "Working…" tool-call streaming via the bridge (default on; `0` disables) |
+| `AUTO_RESPAWN` | no | Errored sessions respawn once as seeded continuations (default on; `0` disables) |
+| `SILENCE_ALERT_MINUTES` | no | Quiet-streak before a "still working?" note (default 20, `0` disables) |
+| `OPENAI_API_KEY` | no | Enables voice-note steering via Whisper transcription |
 
 ## 6. Run
 

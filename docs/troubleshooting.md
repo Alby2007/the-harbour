@@ -60,6 +60,8 @@ the service key lost `ManageOrgSessions`. The exception is in the log.
 
 ## High ACU burn
 
-`MAX_ACU_LIMIT` only guards v3-created sessions. Bridge (`model:`) sessions
-have no cap; `swe2-max` and the priority/preview tiers are the expensive
-ones — prefer `lite`/`swe2-medium` for routine phone tasks.
+`MAX_ACU_LIMIT` only guards v3-created sessions server-side. Bridge
+(`model:`) sessions have no server-side cap — but `/devin budget:<n>`
+still parks them bot-side when burn crosses it. `swe2-max` and the
+priority/preview tiers are the expensive ones — prefer `lite`/`swe2-medium`
+for routine phone tasks.

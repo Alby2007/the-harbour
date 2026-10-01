@@ -100,6 +100,12 @@ variants · `devin-opus-5-5` Opus 5.5 · `devin-gpt-6-sol`,
  "params":{"org_id":"org-..."}}
 {"id":5,"method":"_cognition.ai/snapshot-setup/create-blueprint",
  "params":{"org_id":"org-...","repo_name":"Alby2007/Stockbot"}}   // if missing
+//
+// Probed (scripts/probe_snapshots.py): blueprints carry
+// blueprint_id / repo_name / current_version_id(+source) — versions are
+// created server-side ("env_suggestion"). There is NO snapshot/blueprint
+// select in session/new's configOptions and no get/update/save methods —
+// blueprints auto-apply per repo; you can't pin a snapshot at create time.
 
 // -> session/prompt   ⚠ response arrives at TURN END (minutes) — don't wait
 {"id":4,"method":"session/prompt","params":{
