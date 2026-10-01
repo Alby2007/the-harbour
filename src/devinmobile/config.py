@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     create_as_user_id: str | None = None
 
     db_path: str = "devinmobile.db"
-    poll_interval_seconds: float = 15.0
+    poll_interval_seconds: float = 5.0
 
     # ACP bridge (model-selected cloud sessions). Written by `devin auth login`.
     devin_credentials_path: str = "~/.local/share/devin/credentials.toml"

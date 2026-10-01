@@ -45,6 +45,9 @@ Refreshes a session's status embed on demand (defaults to the most recent).
 - **Steering**: type anything → forwarded via `POST /messages` → ✅ reaction
   = delivered, ❌ = failed. A suspended session auto-resumes on message.
   Discord attachments ride along as `attachment_urls`.
+- **Liveness**: the bot shows "typing…" in the thread while the session is
+  mid-turn (status `running` without a `waiting_for_*` detail). v3 exposes
+  no tool-call progress — the dots are the "still working" signal.
 
 ## Buttons (anchor embed)
 

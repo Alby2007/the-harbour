@@ -210,20 +210,22 @@ def register_commands(bot: "DevinMobileBot") -> None:
             embed=status_embed(session, fallback_title=title, model=model_label),
             view=SessionView(session.session_id, session.url, bot.handle_component),
         )
-        await bot.db.upsert_binding(
-            Binding(
-                session_id=session.session_id,
-                thread_id=thread.id,
-                channel_id=hub.id,
-                anchor_msg_id=anchor.id,
-                title=title,
-                url=session.url,
-                status=session.status,
-                status_detail=session.status_detail,
-                model=model_label,
-            )
+        binding = Binding(
+            session_id=session.session_id,
+            thread_id=thread.id,
+            channel_id=hub.id,
+            anchor_msg_id=anchor.id,
+            title=title,
+            url=session.url,
+            status=session.status,
+            status_detail=session.status_detail,
+            model=model_label,
         )
+        await bot.db.upsert_binding(binding)
         await interaction.followup.send(f"Session started → {thread.mention}")
+        # Devin's first ack lands within seconds — poll immediately instead
+        # of waiting for the first scheduled tick.
+        bot.relay.request_poll(binding)
 
     @tree.command(name="sessions", description="List sessions started through this bot")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)

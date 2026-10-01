@@ -116,7 +116,7 @@ cp .env.example .env
 | `MAX_ACU_LIMIT` | no | Per-session ACU cap, v3-created sessions only (default 25) |
 | `CREATE_AS_USER_ID` | no | `user-...` for attribution on v3-created sessions |
 | `COMMAND_GUILD_ID` | no | Guild ID → instant slash sync; global sync (~1h) happens anyway |
-| `POLL_INTERVAL_SECONDS` | no | Message/status poll cadence (default 15) |
+| `POLL_INTERVAL_SECONDS` | no | Message/status poll cadence (default 5) |
 | `DB_PATH` | no | SQLite file (default `./devinmobile.db`) |
 | `DEVIN_CREDENTIALS_PATH` | no | CLI credentials (default `~/.local/share/devin/credentials.toml`) |
 | `DEVIN_API_URL_OVERRIDE` | no | Enterprise/staging API host |

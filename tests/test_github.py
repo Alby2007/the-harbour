@@ -23,7 +23,7 @@ from devinmobile.github_client import (
     parse_issue_ref,
     parse_pr_url,
 )
-from devinmobile.models import PullRequest, Session
+from devinmobile.models import MessagePage, PullRequest, Session
 from devinmobile.relay import Relay
 from devinmobile.views import make_custom_id, parse_custom_id
 from devinmobile.webhook_server import WebhookServer
@@ -257,12 +257,17 @@ class _Card:
 
 
 class _RelayThread:
-    """Stands in for discord.Thread — records sends and card edits."""
+    """Stands in for discord.Thread — records sends, card edits, typing."""
 
     def __init__(self) -> None:
         self.sent: list[tuple] = []
         self.cards: dict[int, _Card] = {}
+        self.typing_count = 0
         self._next = 1000
+
+    def typing(self):
+        # discord.py: `await channel.typing()` sends one indicator
+        return _TypingOnce(self)
 
     async def send(self, *args: Any, **kw: Any) -> Any:
         self.sent.append((args, kw))
@@ -275,6 +280,16 @@ class _RelayThread:
 
     async def fetch_message(self, mid: int) -> _Card:
         return self.cards[mid]
+
+
+class _TypingOnce:
+    def __init__(self, thread: _RelayThread) -> None:
+        self._t = thread
+
+    def __await__(self):
+        async def _go():
+            self._t.typing_count += 1
+        return _go().__await__()
 
 
 class _FakeGithub:
@@ -370,4 +385,42 @@ async def test_poll_pr_ci_failure_mentions(tmp_path):
     await relay._sync_prs(binding, _session_with_pr(url))
     texts = [str(a[0]) for a, _ in thread.sent if a]
     assert any("<@111>" in t and "CI failing" in t for t in texts)
+    await db.close()
+
+
+# ---- typing indicator ---------------------------------------------------------
+
+
+class _FakeDevin:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    async def list_messages(self, sid, after=None):
+        return MessagePage(items=[])
+
+    async def get_session(self, sid):
+        return self.session
+
+
+async def test_typing_while_working_not_when_waiting(tmp_path):
+    db = await Database.connect(str(tmp_path / "t.db"))
+    binding = Binding(session_id="s1", thread_id=10, channel_id=1)
+    await db.upsert_binding(binding)
+    thread = _RelayThread()
+
+    working = Session(session_id="s1", url="u", status="running",
+                      status_detail="working")
+    relay = Relay(SimpleNamespace(get_channel=lambda _id: thread),
+                  _FakeDevin(working), db, _settings())
+    async def _t(_b):
+        return thread
+    relay._thread = _t
+    await relay.poll_binding(binding)
+    assert thread.typing_count == 1
+
+    waiting = Session(session_id="s1", url="u", status="running",
+                      status_detail="waiting_for_user")
+    relay.devin = _FakeDevin(waiting)
+    await relay.poll_binding(binding)
+    assert thread.typing_count == 1  # unchanged — turn ended, no dots
     await db.close()

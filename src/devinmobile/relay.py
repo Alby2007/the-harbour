@@ -136,6 +136,21 @@ class Relay:
         self.settings = settings
         self.github = github
         self._component_handler = component_handler
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock(self, session_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(session_id, asyncio.Lock())
+
+    def request_poll(self, binding: Binding) -> None:
+        """Schedule an out-of-band poll for one binding — used right after
+        we send Devin a message so the reply doesn't wait for the tick."""
+        async def _poll() -> None:
+            try:
+                await self.poll_binding(binding)
+            except Exception:
+                log.exception("on-demand poll failed for %s", binding.session_id)
+
+        asyncio.create_task(_poll())
 
     async def run_forever(self) -> None:
         while True:
@@ -150,6 +165,10 @@ class Relay:
             await asyncio.sleep(self.settings.poll_interval_seconds + random.uniform(0, 3))
 
     async def poll_binding(self, binding: Binding) -> None:
+        async with self._lock(binding.session_id):
+            await self._poll(binding)
+
+    async def _poll(self, binding: Binding) -> None:
         cursor = binding.msg_cursor
         last_devin: str | None = None
         while True:
@@ -167,6 +186,7 @@ class Relay:
 
         session = await self.devin.get_session(binding.session_id)
         await self._sync_prs(binding, session)
+        await self._typing(binding, session)
         notif = classify_transition(
             binding.status, binding.status_detail, session, last_devin
         )
@@ -182,6 +202,25 @@ class Relay:
         if session.status in QUIET_STATUSES:
             binding.active = False
         await self.db.upsert_binding(binding)
+
+    # Statuses that mean "Devin is actively working right now". waiting_for_*
+    # details mean the turn ended — no typing dots for a parked turn.
+    _WORKING_DETAILS = {"working", "running", None}
+
+    async def _typing(self, binding: Binding, session: Session) -> None:
+        """Show the bot as 'typing…' in the thread while Devin is mid-turn —
+        v3 exposes no tool-call progress, so this is the liveness signal."""
+        if session.status not in {"running", "claimed", "resuming", "new"}:
+            return
+        if session.status_detail in {"waiting_for_user", "waiting_for_approval"}:
+            return
+        thread = await self._thread(binding)
+        if thread is None:
+            return
+        try:
+            await thread.typing()  # one-shot ~10s indicator per poll tick
+        except discord.HTTPException:
+            pass
 
     # ---- PR tracking -------------------------------------------------------
 

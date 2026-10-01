@@ -126,6 +126,9 @@ class DevinMobileBot(discord.Client):
             binding.active = True
             await self.db.upsert_binding(binding)
             await message.add_reaction("\u2705")
+            # Devin's ack typically lands within seconds — don't make the
+            # reply wait for the next scheduled tick.
+            self.relay.request_poll(binding)
         except Exception:
             log.exception("forward failed for %s", binding.session_id)
             await message.add_reaction("\u274C")
