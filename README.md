@@ -24,7 +24,10 @@ approval → anything you type in the thread steers the session.
   approval requests / failures / PR+CI transitions; silent on routine
   suspensions
 - **Steering** — any message in a bound thread forwards to the session
-  (auto-resumes suspended sessions); attachments pass through as URLs
+  (auto-resumes suspended sessions); attachments pass through as URLs;
+  links are fetched inline — GitHub URLs via the App (private repos work),
+  other pages via readability extraction — so Devin reads them without
+  relying on its own browser
 - **PR cards** — when a session opens a PR, the thread gets a card with
   state + CI status and **Merge / Approve / Close** buttons (GitHub App)
 - **PR loop, closed** — Merge/Approve/Close/Auto-merge buttons, CI-failure

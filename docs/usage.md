@@ -80,6 +80,12 @@ Refreshes a session's status embed on demand (defaults to the most recent).
 - **Steering**: type anything → forwarded via `POST /messages` → ✅ reaction
   = delivered, ❌ = failed. A suspended session auto-resumes on message.
   Discord attachments ride along as `attachment_urls`.
+- **Link reading**: URLs in a steering message are fetched by the bot and
+  appended to the prompt as `Link context` blocks — Devin reads the text
+  instead of having to browse. `github.com` issue/PR/commit/blob links go
+  through the GitHub App (private repos included); everything else is a
+  plain GET + readability extraction. Caps: 3 links/message, ~3k chars
+  each. Unreadable links are noted so Devin knows to try its own browser.
 - **Liveness**: the bot shows "typing…" while the session is mid-turn, and
   (when the bridge is available) a single **"Working…"** message tracks the
   live tool calls — `Read /path/x.py`, `Run pytest -x` — edited in place

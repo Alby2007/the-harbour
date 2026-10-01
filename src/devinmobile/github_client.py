@@ -309,3 +309,25 @@ class GithubClient:
 
     async def get_issue(self, owner: str, repo: str, number: int) -> dict[str, Any]:
         return await self._req("GET", f"/repos/{owner}/{repo}/issues/{number}")
+
+    async def get_issue_comments(
+        self, owner: str, repo: str, number: int, *, per_page: int = 5
+    ) -> list[dict[str, Any]]:
+        return await self._req(
+            "GET",
+            f"/repos/{owner}/{repo}/issues/{number}/comments?per_page={per_page}",
+        )
+
+    # ---- repo content (link-reading) -------------------------------------
+
+    async def get_commit(self, owner: str, repo: str, sha: str) -> dict[str, Any]:
+        return await self._req("GET", f"/repos/{owner}/{repo}/commits/{sha}")
+
+    async def get_file(
+        self, owner: str, repo: str, path: str, ref: str
+    ) -> dict[str, Any]:
+        """Contents API row for a file — callers check `encoding` (base64)
+        or `type` (dir → unsupported)."""
+        return await self._req(
+            "GET", f"/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+        )

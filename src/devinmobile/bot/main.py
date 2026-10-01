@@ -10,6 +10,7 @@ from ..db import Database
 from ..devin_client import DevinClient
 from ..embeds import status_embed
 from ..github_client import GithubClient, PullRef, parse_issue_ref
+from ..links import enrich as enrich_links
 from ..relay import Relay
 from ..scheduler import Scheduler
 from ..views import MergeConfirmView, dispatch
@@ -151,6 +152,15 @@ class DevinMobileBot(discord.Client):
                     log.exception("voice transcription failed")
                     await message.add_reaction("🎤")
                     return
+        n_links = 0
+        if content and ("http://" in content or "https://" in content):
+            # Fetch link contents here — Devin's sandbox browser can't reach
+            # private GitHub (our App can) or anything paywalled, so the
+            # extracted text rides inside the prompt.
+            try:
+                content, n_links = await enrich_links(content, self.github)
+            except Exception:
+                log.exception("link enrichment failed")
         try:
             session = await self.devin.send_message(
                 binding.session_id,
@@ -166,6 +176,10 @@ class DevinMobileBot(discord.Client):
                 binding.active = True
                 await self.db.upsert_binding(binding)
             await message.add_reaction("\u2705")
+            if n_links:
+                await message.channel.send(
+                    f"📎 Read {n_links} link{'s' if n_links > 1 else ''} for Devin"
+                )
             # Placeholder covers the send→first-output dead air; it morphs
             # into the Working list on the first streamed tool call and is
             # deleted when the reply lands.
