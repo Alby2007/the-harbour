@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     seen_event_ids TEXT NOT NULL DEFAULT '[]',
     active         INTEGER NOT NULL DEFAULT 1,
     model          TEXT,
+    last_msg       TEXT,
     created_at     INTEGER NOT NULL
 );
 
@@ -41,7 +42,10 @@ CREATE TABLE IF NOT EXISTS prs (
 """
 
 # Columns added after the initial schema — keyed by column name.
-MIGRATIONS = {"model": "ALTER TABLE bindings ADD COLUMN model TEXT"}
+MIGRATIONS = {
+    "model": "ALTER TABLE bindings ADD COLUMN model TEXT",
+    "last_msg": "ALTER TABLE bindings ADD COLUMN last_msg TEXT",
+}
 
 # How many event ids to keep for replay dedupe.
 SEEN_CAP = 500
@@ -76,6 +80,7 @@ class Binding:
     seen_event_ids: set[str] = field(default_factory=set)
     active: bool = True
     model: str | None = None
+    last_msg: str | None = None  # most recent Devin message text (for ?-detection)
     created_at: int = 0
 
 
@@ -114,6 +119,7 @@ class Database:
             seen_event_ids=set(json.loads(row["seen_event_ids"])),
             active=bool(row["active"]),
             model=row["model"] if "model" in row.keys() else None,
+            last_msg=row["last_msg"] if "last_msg" in row.keys() else None,
             created_at=row["created_at"] or 0,
         )
 
@@ -124,20 +130,20 @@ class Database:
             """INSERT INTO bindings
                (session_id, thread_id, channel_id, anchor_msg_id, title, url,
                 status, status_detail, msg_cursor, seen_event_ids, active, model,
-                created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                last_msg, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
                  url=excluded.url, status=excluded.status,
                  status_detail=excluded.status_detail, msg_cursor=excluded.msg_cursor,
                  seen_event_ids=excluded.seen_event_ids, active=excluded.active,
-                 model=excluded.model""",
+                 model=excluded.model, last_msg=excluded.last_msg""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
                 json.dumps(sorted(b.seen_event_ids)[-SEEN_CAP:]),
-                int(b.active), b.model, b.created_at,
+                int(b.active), b.model, b.last_msg, b.created_at,
             ),
         )
         await self._conn.commit()

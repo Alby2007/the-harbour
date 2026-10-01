@@ -23,7 +23,7 @@ from devinmobile.github_client import (
     parse_issue_ref,
     parse_pr_url,
 )
-from devinmobile.models import MessagePage, PullRequest, Session
+from devinmobile.models import MessagePage, PullRequest, Session, SessionMessage
 from devinmobile.relay import Relay
 from devinmobile.views import make_custom_id, parse_custom_id
 from devinmobile.webhook_server import WebhookServer
@@ -394,12 +394,50 @@ async def test_poll_pr_ci_failure_mentions(tmp_path):
 class _FakeDevin:
     def __init__(self, session: Session) -> None:
         self.session = session
+        self.queued: list = []  # messages returned on the first call only
 
     async def list_messages(self, sid, after=None):
-        return MessagePage(items=[])
+        items, self.queued = self.queued, []
+        return MessagePage(items=items)
 
     async def get_session(self, sid):
         return self.session
+
+
+async def test_question_detection_survives_split_ticks(tmp_path):
+    """Regression: the '?' message and the waiting_for_user flip arrive in
+    different polls — the ping must still quote the question."""
+    db = await Database.connect(str(tmp_path / "t.db"))
+    binding = Binding(session_id="s1", thread_id=10, channel_id=1)
+    await db.upsert_binding(binding)
+    thread = _RelayThread()
+
+    relay = Relay(SimpleNamespace(get_channel=lambda _id: thread),
+                  _FakeDevin(Session(session_id="s1", url="u",
+                                     status="running", status_detail="working")),
+                  db, _settings())
+    async def _t(_b):
+        return thread
+    relay._thread = _t
+
+    # poll 1: Devin's question relays while the turn is still running
+    relay.devin.queued = [SessionMessage(
+        event_id="e1", source="devin", created_at=1,
+        message="Two config files — which one should I use?",
+    )]
+    await relay.poll_binding(binding)
+    assert binding.last_msg and binding.last_msg.endswith("?")
+    texts = [str(a[0]) for a, _ in thread.sent if a]
+    assert not any("asking" in t or "finished its turn" in t for t in texts)
+
+    # poll 2: no new messages, but the detail flips to waiting_for_user
+    relay.devin = _FakeDevin(Session(
+        session_id="s1", url="u", status="running",
+        status_detail="waiting_for_user"))
+    await relay.poll_binding(binding)
+    texts = [str(a[0]) for a, _ in thread.sent if a]
+    assert any("asking" in t and "which one should I use?" in t for t in texts), texts
+    await db.close()
 
 
 async def test_typing_while_working_not_when_waiting(tmp_path):

@@ -170,13 +170,15 @@ class Relay:
 
     async def _poll(self, binding: Binding) -> None:
         cursor = binding.msg_cursor
-        last_devin: str | None = None
         while True:
             page = await self.devin.list_messages(binding.session_id, after=cursor)
             for m in relayable(page.items, binding.seen_event_ids):
                 clean, _ = extract_attachments(m.message or "")
                 if clean:
-                    last_devin = clean
+                    # persisted on the binding so a waiting_for_user flip in a
+                    # LATER tick still sees the question text — the message and
+                    # the status change routinely land in different polls
+                    binding.last_msg = clean
                 await self._relay_message(binding, m)
             if page.end_cursor:
                 cursor = page.end_cursor
@@ -188,7 +190,7 @@ class Relay:
         await self._sync_prs(binding, session)
         await self._typing(binding, session)
         notif = classify_transition(
-            binding.status, binding.status_detail, session, last_devin
+            binding.status, binding.status_detail, session, binding.last_msg
         )
         if session.title:
             binding.title = session.title
