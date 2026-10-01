@@ -646,6 +646,8 @@ class Relay:
         glanceable answer to 'is Devin doing anything right now'."""
         if n == self._last_presence:
             return
+        if not self.bot.is_ready():
+            return  # ws doesn't exist yet — next tick retries
         self._last_presence = n
         try:
             await self.bot.change_presence(
@@ -658,7 +660,7 @@ class Relay:
                     else None  # idle — don't advertise a zero
                 )
             )
-        except discord.HTTPException:
+        except Exception:  # noqa: BLE001 — presence is cosmetic
             log.debug("presence update failed", exc_info=True)
 
     async def _completion_pr(self, binding: Binding) -> PrRow | None:

@@ -46,6 +46,9 @@ class _Bot:
     async def fetch_channel(self, _id):
         return None
 
+    def is_ready(self) -> bool:
+        return True
+
     async def change_presence(self, *, activity=None, **kw):
         self.presence.append(activity.name if activity else "(cleared)")
 
