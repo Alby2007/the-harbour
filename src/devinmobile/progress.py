@@ -87,9 +87,12 @@ class ProgressTracker:
         st = self._streams.setdefault(binding.session_id, _Stream())
         if st.lines and st.lines[-1] == line:
             return  # consecutive dupes (retried reads etc.) add nothing
+        was_idle = not st.lines
         st.lines.append(line)
         st.dirty = True
-        if time.time() - st.last_edit >= MIN_EDIT_INTERVAL:
+        # the thinking→working morph is the one transition that must not
+        # wait for the throttle — it's the user-visible "it started" signal
+        if was_idle or time.time() - st.last_edit >= MIN_EDIT_INTERVAL:
             await self._flush(binding, st)
         elif st.flush_task is None or st.flush_task.done():
             st.flush_task = asyncio.create_task(self._flush_later(binding, st))
