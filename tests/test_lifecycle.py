@@ -20,6 +20,7 @@ class _Settings:
     github_webhook_secret = "wh"
     github_webhook_port = 0
     task_intake_token = ""
+    task_intake_token_map: dict = {}
     silence_alert_minutes = 0
     create_as_user_id = None
     github_merge_method = "squash"
@@ -147,7 +148,9 @@ async def test_error_respawns_once_with_summary(tmp_path, monkeypatch):
     monkeypatch.setattr(relay_mod, "spawn_session", fake_spawn)
     bot = _Bot()
     r = Relay(bot, None, db, _Settings())  # type: ignore[arg-type]
-    b = _binding(repos="o/r", last_msg="halfway there", url="u1")
+    b = _binding(
+        repos="o/r", last_msg="halfway there", url="u1", spawned_by="77",
+    )
     sess = Session(
         session_id="s1", url="u1", status="error",
         status_detail="crashed",
@@ -159,6 +162,8 @@ async def test_error_respawns_once_with_summary(tmp_path, monkeypatch):
     await r._maybe_respawn(b, sess)
     assert spawned["continued_from"] == "s1"
     assert spawned["repos"] == ["o/r"]
+    # nobody initiated the respawn — ownership inherits from the parent
+    assert spawned["spawned_by"] == "77"
     assert "added half the endpoints" in spawned["prompt"]
     assert "crashed" in spawned["prompt"]
     assert "a.py" in spawned["prompt"]
@@ -224,6 +229,7 @@ async def test_review_label_spawns_once(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert calls[0]["review_of"] == "o/r#9"
     assert calls[0]["repos"] == ["o/r"]
+    assert calls[0]["spawned_by"] == "github"  # infra marker, not a user
     assert "Review pull request o/r#9" in calls[0]["prompt"]
 
 

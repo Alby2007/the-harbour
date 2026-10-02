@@ -71,6 +71,7 @@ class Scheduler:
                     repos=s.repos or None,
                     model=s.model,
                     title=f"[scheduled] {s.prompt[:60]}",
+                    spawned_by=s.spawned_by,
                 )
                 await thread.send(
                     f"Spawned by schedule #{s.id} (every {s.interval_seconds // 60}m)."
@@ -146,6 +147,9 @@ class Scheduler:
                         repos=s.repos or None,
                         model=s.model,
                         title=f"[monitor] {s.watch[:60]}",
+                        # the watch owner's fix session pings the watch
+                        # owner — they set it, they own the alert
+                        spawned_by=s.spawned_by,
                     )
                     # bookkeeping BEFORE the provenance post — a failed
                     # send mustn't hide the spawn from the dedup key or

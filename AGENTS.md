@@ -256,6 +256,17 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   `initialize` capabilities but rejected/ignored in every wire shape (no
   `/exec` possible — a user shell needs a normal steering turn);
   `session/list` does work. Full table in docs/api-internals.md.
+- Attribution: `bindings.spawned_by`/`schedules.spawned_by` record who
+  spawned — a discord snowflake, or a marker (`'github'` label triggers,
+  `'intake'`/token-map names from `/task`, `''` legacy). Every ping routes
+  through `mention_for()`: snowflake → owner only, marker/empty → the
+  allowlist join (team events nobody owns). `/continue` TRANSFERS
+  ownership to the tapper; auto-respawn and chain phases INHERIT it (a
+  Continue→ tap doesn't re-own). COALESCE/NULLIF upsert keeps a
+  state-only write from wiping it. `spawn_session`'s v3 path maps
+  discord-id → `create_as_user_id` via `DEVIN_USER_MAP` (bridge can't
+  remap — ACP creates as the CLI user); `TASK_INTAKE_TOKENS` parses to
+  `task_intake_token_map`, and a mapped token's `by:` field is ignored.
 - Test fixture leak: `Database.connect`'s aiosqlite worker thread is
   non-daemon — tests that skip `db.close()` leave pytest unable to exit
   (zombie processes accumulate). `tests/conftest.py` auto-closes every

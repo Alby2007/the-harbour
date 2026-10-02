@@ -162,3 +162,30 @@ async def test_repo_notes_eight_per_repo_cap(tmp_path):
     got = await db.notes_for_repos(["o/r"])
     assert len(got["o/r"]) == 8
     assert got["o/r"][0] == "note 9"  # newest first
+
+
+async def test_spawned_by_roundtrip_both_tables(tmp_path):
+    db = await Database.connect(str(tmp_path / "t.db"))
+    await db.upsert_binding(Binding(
+        session_id="s1", thread_id=1, channel_id=1, spawned_by="42",
+    ))
+    assert (await db.get_binding("s1")).spawned_by == "42"
+    sid = await db.add_schedule(ScheduleRow(
+        id=0, prompt="x", spawned_by="42",
+    ))
+    assert (await db.all_schedules())[0].spawned_by == "42"
+    assert sid > 0
+
+
+async def test_spawned_by_survives_state_only_upsert(tmp_path):
+    # a poll-tick upsert (spawned_by="") must not wipe the spawn-time
+    # attribution — same COALESCE/NULLIF convention as summary/repos
+    db = await Database.connect(str(tmp_path / "t.db"))
+    await db.upsert_binding(Binding(
+        session_id="s1", thread_id=1, channel_id=1, spawned_by="github",
+    ))
+    await db.upsert_binding(Binding(
+        session_id="s1", thread_id=1, channel_id=1, status="exit",
+    ))
+    b = await db.get_binding("s1")
+    assert b.spawned_by == "github" and b.status == "exit"

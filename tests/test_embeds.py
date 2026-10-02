@@ -1,4 +1,9 @@
-from devinmobile.embeds import completion_embed, status_embed
+from devinmobile.embeds import (
+    completion_embed,
+    mention_for,
+    spawned_by_label,
+    status_embed,
+)
 from devinmobile.models import PullRequest, Session
 
 
@@ -49,3 +54,31 @@ def test_completion_embed_structured_output():
 def test_embed_falls_back_to_session_id_title():
     e = status_embed(make_session(title=None))
     assert e.title == "devin-x"
+
+
+def test_mention_for_owner_vs_infra():
+    allowed = frozenset({1, 2})
+    # a Discord-user spawner gets the ping alone — the whole allowlist
+    # only joins for marker/legacy spawnings nobody owns
+    assert mention_for("1", allowed) == "<@1>"
+    assert mention_for("github", allowed) == "<@1> <@2>"
+    assert mention_for("intake", allowed) == "<@1> <@2>"
+    assert mention_for("", allowed) == "<@1> <@2>"
+    # a digit spawned_by that ISN'T an allowlisted id — e.g. a caller-
+    # supplied /task `by:` — can't redirect pings at a stranger
+    assert mention_for("999", allowed) == "<@1> <@2>"
+
+
+def test_spawned_by_label():
+    assert spawned_by_label("42") == "<@42>"
+    assert spawned_by_label("github") == "github"
+    assert spawned_by_label("") == ""
+
+
+def test_status_embed_by_field():
+    e = status_embed(make_session(), spawned_by="42")
+    assert next(f for f in e.fields if f.name == "By").value == "<@42>"
+    e = status_embed(make_session(), spawned_by="github")
+    assert next(f for f in e.fields if f.name == "By").value == "github"
+    e = status_embed(make_session())  # unset → no field at all
+    assert all(f.name != "By" for f in e.fields)

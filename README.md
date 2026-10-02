@@ -61,6 +61,11 @@ approval → anything you type in the thread steers the session.
   `ci:owner/repo`) checks each interval and spawns a fix session only on
   a red edge — cooldown + still-running dedup keep a hard-down target to
   one session per window; green-after-red posts a recovery note
+- **Attribution** — every spawn records `spawned_by`; completion/PR pings
+  go to the owner instead of the whole allowlist (infra events still ping
+  everyone), `/continue` transfers ownership, respawns/chains inherit it.
+  `TASK_INTAKE_TOKENS` gives each HTTP client a name; `DEVIN_USER_MAP`
+  creates sessions as the spawner's own Devin user
 - **Inbox** — `/inbox` (and `/schedule kind:inbox every:1d`) is the
   morning triage card: sessions waiting on you, errored runs, chains
   paused at Continue→, red monitors, and open PRs with CI state — each

@@ -58,6 +58,7 @@ async def spawn_session(
     review_of: str = "",
     chain: dict | None = None,
     attachment_urls: list[str] | None = None,
+    spawned_by: str = "",
 ) -> tuple[Session, discord.Thread]:
     """Create a Devin session + its Discord thread + binding.
 
@@ -134,6 +135,17 @@ async def spawn_session(
         except Exception as e:
             raise SpawnError(f"Session create failed: `{e}`") from e
     else:
+        # DEVIN_USER_MAP discord-id → devin-user — the session lands in
+        # the spawner's own web session list. Gated on the allowlist: a
+        # caller-supplied `by:` (task intake) can't remap into someone
+        # else's Devin identity. Bridge path can't remap either (ACP
+        # creates as the CLI-authed user).
+        create_as = (
+            bot.settings.devin_user_id_map.get(spawned_by)
+            if spawned_by.isdigit()
+            and int(spawned_by) in bot.settings.allowed_user_id_set
+            else None
+        ) or bot.settings.create_as_user_id
         try:
             session = await bot.devin.create_session(
                 prompt=prompt,
@@ -144,7 +156,7 @@ async def spawn_session(
                 max_acu_limit=(
                     int(budget) if budget else bot.settings.max_acu_limit
                 ),
-                create_as_user_id=bot.settings.create_as_user_id,
+                create_as_user_id=create_as,
                 attachment_urls=attachment_urls,
             )
         except Exception as e:
@@ -159,7 +171,10 @@ async def spawn_session(
     except discord.HTTPException:
         pass
     anchor = await thread.send(
-        embed=status_embed(session, fallback_title=title, model=model_label),
+        embed=status_embed(
+            session, fallback_title=title, model=model_label,
+            spawned_by=spawned_by,
+        ),
         view=SessionView(session.session_id, session.url, bot.handle_component),
     )
     binding = Binding(
@@ -177,6 +192,7 @@ async def spawn_session(
         max_acu=budget,
         review_of=review_of,
         chain=chain,
+        spawned_by=spawned_by,
         last_activity_at=int(time.time()),
     )
     await bot.db.upsert_binding(binding)

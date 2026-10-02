@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     review_of      TEXT,
     chain          TEXT,
     summary        TEXT,
+    spawned_by     TEXT,
     created_at     INTEGER NOT NULL
 );
 
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     watch_state      TEXT NOT NULL DEFAULT '',  -- '' | green | red (last observed)
     last_fired_at    INTEGER,       -- monitor: last spawn (cooldown math)
     cooldown_seconds INTEGER NOT NULL DEFAULT 14400,  -- still-red re-fire floor
+    spawned_by       TEXT,          -- creator's discord id — spawns inherit it
     created_at       INTEGER NOT NULL
 );
 
@@ -118,6 +120,9 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         # structured_output.summary captured at completion — feeds /digest
         # and digest-kind schedules without N API calls
         "summary": "ALTER TABLE bindings ADD COLUMN summary TEXT",
+        # who spawned it — a discord snowflake, or a marker like
+        # 'github'/'intake'/a token-map name; '' = legacy/unattributed
+        "spawned_by": "ALTER TABLE bindings ADD COLUMN spawned_by TEXT",
     },
     "prs": {
         "auto_merge": (
@@ -144,6 +149,8 @@ MIGRATIONS: dict[str, dict[str, str]] = {
             "ALTER TABLE schedules ADD COLUMN "
             "cooldown_seconds INTEGER NOT NULL DEFAULT 14400"
         ),
+        # the creator's discord id — every spawn the row fires inherits it
+        "spawned_by": "ALTER TABLE schedules ADD COLUMN spawned_by TEXT",
     },
 }
 
@@ -194,6 +201,7 @@ class ScheduleRow:
     watch_state: str = ""  # '' | green | red — last observed, for edges
     last_fired_at: int | None = None  # monitor: cooldown anchor
     cooldown_seconds: int = 14400  # still-red re-fire floor (4h)
+    spawned_by: str = ""  # creator's discord id — spawns inherit it
     created_at: int = 0
 
 
@@ -222,6 +230,10 @@ class Binding:
     review_of: str = ""  # "owner/repo#n" when spawned by the review label
     chain: dict | None = None  # playbook state — see chains.py for shape
     summary: str = ""  # structured_output.summary captured at completion
+    # who spawned it — discord snowflake, or a marker ('github', 'intake',
+    # a token-map name); '' = legacy/unattributed. mention_for() routes
+    # pings through this: snowflake → owner ping, else all-allowlist.
+    spawned_by: str = ""
     created_at: int = 0
 
 
@@ -292,6 +304,10 @@ class Database:
                 if "chain" in row.keys() else None
             ),
             summary=(row["summary"] or "") if "summary" in row.keys() else "",
+            spawned_by=(
+                (row["spawned_by"] or "")
+                if "spawned_by" in row.keys() else ""
+            ),
             created_at=row["created_at"] or 0,
         )
 
@@ -304,8 +320,8 @@ class Database:
                 status, status_detail, msg_cursor, seen_event_ids, active, model,
                 last_msg, acus, acu_warned, last_activity_at, quiet_alerted,
                 repos, continued_from, max_acu, review_of, chain, summary,
-                created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                spawned_by, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
@@ -329,7 +345,10 @@ class Database:
                  -- same convention: a state-only upsert must not wipe the
                  -- completion-captured summary
                  summary=COALESCE(NULLIF(excluded.summary, ''),
-                                  bindings.summary)""",
+                                  bindings.summary),
+                 -- or the spawn-time owner attribution
+                 spawned_by=COALESCE(NULLIF(excluded.spawned_by, ''),
+                                     bindings.spawned_by)""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
@@ -341,7 +360,7 @@ class Database:
                 b.repos or None, b.continued_from or None, b.max_acu,
                 b.review_of or None,
                 json.dumps(b.chain) if b.chain else None,
-                b.summary or None, b.created_at,
+                b.summary or None, b.spawned_by or None, b.created_at,
             ),
         )
         await self._conn.commit()
@@ -551,6 +570,7 @@ class Database:
             watch_state=row["watch_state"] or "",
             last_fired_at=row["last_fired_at"],
             cooldown_seconds=row["cooldown_seconds"] or 14400,
+            spawned_by=row["spawned_by"] or "",
             created_at=row["created_at"],
         )
 
@@ -562,12 +582,13 @@ class Database:
             """INSERT INTO schedules
                (prompt, repos, model, interval_seconds, next_run_at, enabled,
                 last_session_id, kind, watch, expect, watch_state,
-                last_fired_at, cooldown_seconds, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                last_fired_at, cooldown_seconds, spawned_by, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (s.prompt, json.dumps(s.repos), s.model, s.interval_seconds,
              s.next_run_at, int(s.enabled), s.last_session_id, s.kind,
              s.watch or None, s.expect or None, s.watch_state,
-             s.last_fired_at, s.cooldown_seconds, s.created_at),
+             s.last_fired_at, s.cooldown_seconds, s.spawned_by or None,
+             s.created_at),
         )
         await self._conn.commit()
         return cur.lastrowid or 0

@@ -356,8 +356,9 @@ async def test_webhook_issue_label_spawns_session(tmp_path, monkeypatch):
     spawned = []
 
     async def fake_spawn(bot, *, prompt, repos=None, model=None, mode=None,
-                         title=None):
-        spawned.append({"prompt": prompt, "repos": repos, "title": title})
+                         title=None, spawned_by=""):
+        spawned.append({"prompt": prompt, "repos": repos, "title": title,
+                        "spawned_by": spawned_by})
         return SimpleNamespace(session_id="s9"), _FakeThread()
 
     monkeypatch.setattr(spawn_mod, "spawn_session", fake_spawn)
@@ -373,6 +374,7 @@ async def test_webhook_issue_label_spawns_session(tmp_path, monkeypatch):
     })
     assert spawned and spawned[0]["repos"] == ["Alby2007/Stockbot"]
     assert "Fix crash" in spawned[0]["prompt"]
+    assert spawned[0]["spawned_by"] == "github"  # infra marker, not a user
 
     # wrong label / unlabel events do nothing
     await srv._on_issue({

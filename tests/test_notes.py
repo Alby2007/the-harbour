@@ -14,6 +14,7 @@ class _Settings:
     auto_respawn = True
     silence_alert_minutes = 0
     create_as_user_id = None
+    devin_user_id_map: dict = {}
     github_merge_method = "squash"
     hub_channel_id = 42
     default_model = None
@@ -241,6 +242,66 @@ async def test_spawn_bridge_inlines_attachment_urls(tmp_path, monkeypatch):
     )
     assert not bot.devin.created  # v3 create never ran
     assert "Attachments:\n- https://cdn/x.png\n- https://cdn/y.png" in prompts[0]
+
+
+# ---- spawned_by attribution ---------------------------------------------------
+
+
+async def test_spawn_records_spawned_by_and_maps_create_as(
+    tmp_path, monkeypatch
+):
+    import discord
+
+    db = await _db(tmp_path)
+    bot = _SpawnBot(db)
+    bot.settings.allowed_user_id_set = {1, 42}
+    bot.settings.devin_user_id_map = {
+        "42": "devin-u-alby",
+        "99": "devin-u-sam",  # mapped but NOT allowlisted — can't claim it
+    }
+    bot.settings.create_as_user_id = "devin-u-default"
+    monkeypatch.setattr(discord, "TextChannel", _Hub)
+    await spawn_mod.spawn_session(bot, prompt="x", spawned_by="42")
+    # mapped + allowlisted spawner → session created AS their Devin user
+    assert bot.devin.created[0]["create_as_user_id"] == "devin-u-alby"
+    b = await db.get_binding("s9")
+    assert b is not None and b.spawned_by == "42"
+
+    # allowlisted but unmapped → the global CREATE_AS_USER_ID fallback
+    await spawn_mod.spawn_session(bot, prompt="x", spawned_by="1")
+    assert bot.devin.created[1]["create_as_user_id"] == "devin-u-default"
+
+    # a caller-supplied digit that isn't allowlisted (e.g. /task `by:`)
+    # can't remap into the mapped user's Devin identity — falls to default
+    await spawn_mod.spawn_session(bot, prompt="x", spawned_by="99")
+    assert bot.devin.created[2]["create_as_user_id"] == "devin-u-default"
+
+
+async def test_spawn_bridge_keeps_spawned_by_no_remap(tmp_path, monkeypatch):
+    """Bridge sessions create as the CLI-authed user — the map can't
+    reach them; spawned_by on the binding stays the record."""
+    import discord
+
+    db = await _db(tmp_path)
+    bot = _SpawnBot(db)
+    bot.settings.devin_user_id_map = {"42": "devin-u-alby"}
+
+    class _Bridge:
+        available = True
+
+        async def create_cloud_session(self, prompt, model=None, repos=None):
+            return type("BS", (), {"session_id": "sb", "model_label": "m"})()
+
+    async def _get_session(sid):
+        return Session(session_id=sid, url="u", status="running")
+
+    bot.bridge = _Bridge()
+    bot.devin.get_session = _get_session  # type: ignore[attr-defined]
+    monkeypatch.setattr(discord, "TextChannel", _Hub)
+    await spawn_mod.spawn_session(bot, prompt="x", model="opus", spawned_by="42")
+    assert not bot.devin.created  # v3 create never ran — nothing to remap
+    b = await db.get_binding("sb")
+    assert b is not None and b.spawned_by == "42"
 
 
 # ---- /note /notes /unnote ----------------------------------------------------

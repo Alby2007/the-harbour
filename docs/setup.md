@@ -134,6 +134,8 @@ cp .env.example .env
 | `GITHUB_TRIGGER_LABEL` | no | Issue label that spawns a session (default `devin`) |
 | `GITHUB_REVIEW_LABEL` | no | PR label that spawns a review session (default `devin-review`) |
 | `TASK_INTAKE_TOKEN` | no | Bearer token enabling `POST /task` (curl/Siri/Raycast → spawn session) on the webhook port; empty = off. Same exposure as the webhook secret — keep behind the same tunnel |
+| `TASK_INTAKE_TOKENS` | no | Per-client bearers `tok:name` (comma-separated) — mapped tokens attribute sessions to the name and ignore the payload's `by:` field. Composes with `TASK_INTAKE_TOKEN` |
+| `DEVIN_USER_MAP` | no | `discord-id:devin-user-id` pairs — a mapped spawner's v3 sessions are created AS their Devin user (needs ImpersonateOrgSessions). Bridge sessions can't remap |
 | `DEVIN_DEFAULT_MODEL` | no | Route every `/devin` through the bridge model unless `model:`/`mode:` is given |
 | `ACP_PROGRESS` | no | Live "Working…" tool-call streaming via the bridge (default on; `0` disables) |
 | `AUTO_RESPAWN` | no | Errored sessions respawn once as seeded continuations (default on; `0` disables) |

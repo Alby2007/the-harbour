@@ -51,6 +51,34 @@ class Settings(BaseSettings):
     # HTTP task intake — POST /task on the webhook port, bearer-authed.
     # Empty = route off. Same trust model as the webhook secret.
     task_intake_token: str = ""
+    # Per-client tokens: "abc:alby,def:sam" → token→name map. A request
+    # authenticated by a mapped token attributes the session to that name
+    # (spawned_by), ignoring any `by:` field in the payload — the mapping
+    # is the stronger claim.
+    task_intake_tokens: str = ""
+
+    # Discord-id → Devin-user-id ("123456:devin-u-alby,…") — a session a
+    # mapped user spawns is created AS their Devin user on the v3 path, so
+    # it shows up in their web session list. Bridge sessions can't remap
+    # (ACP creates as the CLI-authed user) — spawned_by stays authoritative.
+    devin_user_map: str = ""
+
+    @staticmethod
+    def _parse_map(raw: str) -> dict[str, str]:
+        out = {}
+        for pair in raw.split(","):
+            k, sep, v = pair.partition(":")
+            if sep and k.strip() and v.strip():
+                out[k.strip()] = v.strip()
+        return out
+
+    @cached_property
+    def task_intake_token_map(self) -> dict[str, str]:
+        return self._parse_map(self.task_intake_tokens)
+
+    @cached_property
+    def devin_user_id_map(self) -> dict[str, str]:
+        return self._parse_map(self.devin_user_map)
 
     @cached_property
     def github_enabled(self) -> bool:

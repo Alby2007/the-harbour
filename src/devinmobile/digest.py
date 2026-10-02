@@ -9,6 +9,7 @@ from __future__ import annotations
 import discord
 
 from .db import Binding
+from .embeds import spawned_by_label
 
 _DONE = {"exit"}     # classify_transition emits "complete" on exit
 _ERRORED = {"error"}
@@ -20,7 +21,11 @@ def _row(binding: Binding) -> str:
     title = (binding.title or binding.session_id[:12])[:80]
     desc = f" — {binding.summary[:120]}" if binding.summary else ""
     acu = f" · {binding.acus:g} ACU" if binding.acus else ""
-    return f"{title}{desc} · <#{binding.thread_id}>{acu}"
+    by = (
+        f" · {spawned_by_label(binding.spawned_by)}"
+        if binding.spawned_by else ""
+    )
+    return f"{title}{desc} · <#{binding.thread_id}>{acu}{by}"
 
 
 def build_digest(bindings: list[Binding], since: int) -> discord.Embed:

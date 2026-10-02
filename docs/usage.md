@@ -211,8 +211,10 @@ v3 `DELETE` (undocumented — best-effort to stop ACU burn sooner).
 ### `/usage`
 
 ACU burn rollup across sessions this bot started: today / last 7d /
-all-time, top 5 sessions by burn, and a per-repo breakdown. Day buckets
-group by session *start* (ACU is cumulative per session, not per day).
+all-time, top 5 sessions by burn, per-repo breakdown, and a per-user
+breakdown (`spawned_by` — Discord pings for snowflakes, marker names like
+`github`/`intake` as plain text). Day buckets group by session *start*
+(ACU is cumulative per session, not per day).
 
 ### `/devin-status [session_id]`
 
@@ -238,10 +240,17 @@ curl -X POST https://<host>/task \
 Body: `prompt` (required, ≤4000 chars), `repo` (string or array,
 comma-separate works), `title`, `budget` (ACU cap), `attachments` (array
 of ≤8 `http(s)://` URLs, each ≤2048 chars — they must be publicly
-fetchable by Devin). Success → `200` with `session_id`, `thread_id`,
-`session_url`, and `thread_url` — the Discord deep-link is what makes a
-Shortcut useful (tap → lands in the live thread). Errors: `401`
-bad/missing token, `400` bad body, `502` spawn failure.
+fetchable by Devin), `by` (optional caller name ≤64 chars — becomes the
+session's `spawned_by`, so a Discord snowflake pings that user).
+Success → `200` with `session_id`, `thread_id`, `session_url`, and
+`thread_url` — the Discord deep-link is what makes a Shortcut useful
+(tap → lands in the live thread). Errors: `401` bad/missing token, `400`
+bad body, `502` spawn failure.
+
+Per-client tokens: `TASK_INTAKE_TOKENS=abc:alby,def:sam` gives each caller
+its own bearer — requests authed by a mapped token attribute the session
+to the mapped name and **ignore** `by:` (the mapping is the stronger
+claim). Either mechanism alone enables the route; both can coexist.
 
 ## DM intake
 
@@ -367,7 +376,13 @@ findings as a `COMMENT` review (never APPROVE — merging stays human).
 
 ## Notifications
 
-@-mention = phone push. Non-mentions post quietly in the thread.
+@-mention = phone push. Non-mentions post quietly in the thread. Mentions
+route through `spawned_by`: sessions a Discord user spawned ping **that
+user only**; sessions spawned by infra (GitHub labels → `github`, `/task`
+without a mapped token → `intake`, legacy rows → unset) ping the whole
+allowlist — team events nobody in particular owns. Ownership transfers on
+`/continue` (the tapper gets the pings) and **inherits** on auto-respawn
+and chain phases (a Continue→ tap doesn't re-own a playbook).
 
 | Event | Ping? | Text |
 | --- | --- | --- |

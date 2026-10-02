@@ -6,10 +6,11 @@ from devinmobile.bot.commands import parse_every, usage_summary
 from devinmobile.db import Binding
 
 
-def _b(sid, acus, created_at, repos="", title=None):
+def _b(sid, acus, created_at, repos="", title=None, spawned_by=""):
     return Binding(
         session_id=sid, thread_id=1, channel_id=1,
         acus=acus, created_at=created_at, repos=repos, title=title,
+        spawned_by=spawned_by,
     )
 
 
@@ -39,6 +40,21 @@ def test_usage_summary_buckets_and_repos():
     assert s["by_repo"]["o/x"] == [5.0, 2]
     assert s["by_repo"]["o/y"] == [10.0, 1]
     assert s["by_repo"]["(no repo)"] == [1.0, 1]
+    assert s["by_user"]["unattributed"] == [16.0, 4]
+
+
+def test_usage_summary_by_user():
+    now = time.time()
+    bs = [
+        _b("a", 3.0, now - 100, spawned_by="42"),
+        _b("b", 2.0, now - 100, spawned_by="42"),
+        _b("c", 10.0, now - 100, spawned_by="github"),
+        _b("d", 1.0, now - 100),  # legacy row — no attribution
+    ]
+    s = usage_summary(bs, now)
+    assert s["by_user"]["42"] == [5.0, 2]
+    assert s["by_user"]["github"] == [10.0, 1]
+    assert s["by_user"]["unattributed"] == [1.0, 1]
 
 
 def test_usage_summary_empty():

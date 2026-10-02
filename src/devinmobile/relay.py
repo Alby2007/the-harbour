@@ -24,7 +24,12 @@ from .choices import parse_choices
 from .config import Settings
 from .db import Binding, Database, PrRow
 from .devin_client import DevinClient
-from .embeds import completion_embed, pr_embed, status_embed
+from .embeds import (
+    completion_embed,
+    mention_for,
+    pr_embed,
+    status_embed,
+)
 from .github_client import (
     GithubClient,
     PullRef,
@@ -455,7 +460,9 @@ class Relay:
         checks = await self.github.get_checks(ref)  # type: ignore[union-attr]
         row.pr_title = data.get("title") or row.pr_title
         thread = await self._thread(binding)
-        mention = " ".join(f"<@{u}>" for u in self.settings.allowed_user_id_set)
+        mention = mention_for(
+            binding.spawned_by, self.settings.allowed_user_id_set
+        )
         label = f"{row.repo}#{row.number}" if row.repo else f"PR #{row.number}"
 
         # Opt-in auto-merge runs every poll while conditions hold — it can't
@@ -603,7 +610,8 @@ class Relay:
             anchor = await thread.fetch_message(binding.anchor_msg_id)
             await anchor.edit(
                 embed=embed_fn(
-                    session, fallback_title=binding.title, model=binding.model
+                    session, fallback_title=binding.title,
+                    model=binding.model, spawned_by=binding.spawned_by,
                 )
             )
         except discord.HTTPException:
@@ -622,14 +630,16 @@ class Relay:
         # No mention => no push notification: routine transitions stay readable
         # in-channel without buzzing the phone.
         mentions = (
-            " ".join(f"<@{u}>" for u in self.settings.allowed_user_id_set) + " "
+            mention_for(binding.spawned_by, self.settings.allowed_user_id_set)
+            + " "
             if notif.mention
             else ""
         )
         text = mentions + notif.text
         if notif.kind == "complete":
             embed = completion_embed(
-                session, fallback_title=binding.title, model=binding.model
+                session, fallback_title=binding.title, model=binding.model,
+                spawned_by=binding.spawned_by,
             )
             pr_row = await self._completion_pr(binding)
             if pr_row is not None:
@@ -748,6 +758,8 @@ class Relay:
                 continued_from=binding.session_id,
                 # roll the dead session's burn into the chain budget
                 chain=continued_chain(binding.chain, session),
+                # nobody initiated the respawn — the owner stays the owner
+                spawned_by=binding.spawned_by,
             )
         except SpawnError as e:
             log.warning("auto-respawn of %s failed: %s", binding.session_id, e)
@@ -1015,6 +1027,9 @@ class Relay:
             continued_from=binding.session_id,
             review_of=pr_key if phase.review else "",
             chain=new_chain,
+            # a Continue→ tap doesn't re-own the chain — inherit the
+            # original spawner so pings keep going to whoever launched it
+            spawned_by=binding.spawned_by,
         )
         old_thread = await self._thread(binding)
         if old_thread is not None:

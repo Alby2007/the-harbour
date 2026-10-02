@@ -100,6 +100,8 @@ async def test_dm_devin_prefix_spawns(monkeypatch):
     msg = _Msg("Devin: fix the login flake")
     await bot._dm_intake(msg)
     assert spawns[0]["prompt"] == "fix the login flake"
+    # the DM author owns the session — completions ping them, not everyone
+    assert spawns[0]["spawned_by"] == "1"
     # devin: alone — a prefix with nothing after it is a hint, not a spawn
     msg2 = _Msg("devin:")
     await bot._dm_intake(msg2)

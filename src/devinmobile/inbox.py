@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import discord
 
 from .db import Binding, PrRow, ScheduleRow
+from .embeds import spawned_by_label
 
 if TYPE_CHECKING:
     from .db import Database
@@ -22,7 +23,8 @@ _TERMINAL = {"exit", "error", "suspended"}  # same set as relay.QUIET_STATUSES
 
 def _line(b: Binding, extra: str = "") -> str:
     title = (b.title or b.session_id[:12])[:80]
-    return f"{title} · <#{b.thread_id}>{extra}"
+    by = f" · {spawned_by_label(b.spawned_by)}" if b.spawned_by else ""
+    return f"{title} · <#{b.thread_id}>{by}{extra}"
 
 
 def build_inbox(

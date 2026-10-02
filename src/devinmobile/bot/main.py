@@ -300,6 +300,7 @@ class DevinMobileBot(discord.Client):
                 self,
                 prompt=prompt,
                 attachment_urls=[a.url for a in attachments] or None,
+                spawned_by=str(message.author.id),
             )
         except SpawnError as e:
             await message.reply(str(e), mention_author=False)

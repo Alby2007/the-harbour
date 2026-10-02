@@ -12,6 +12,7 @@ class _Settings:
     github_webhook_secret = ""
     github_webhook_port = 0  # ephemeral — the OS picks the port
     task_intake_token = "tok123"
+    task_intake_token_map = {"mapA": "alby", "mapB": "sam"}
     github_enabled = False
 
 
@@ -158,6 +159,7 @@ async def test_task_auth_and_validation(monkeypatch):
 async def test_task_route_absent_without_token(monkeypatch):
     class _NoToken(_Settings):
         task_intake_token = ""
+        task_intake_token_map = {}
 
     srv, _ = await _server(monkeypatch, settings=_NoToken())
     try:
@@ -165,6 +167,51 @@ async def test_task_route_absent_without_token(monkeypatch):
             _port(srv), "/task", token="tok123", json={"prompt": "x"}
         )
         assert status == 404
+    finally:
+        await srv.stop()
+
+
+async def test_task_token_map_attribution(monkeypatch):
+    """A mapped token attributes the spawn to its name — and ignores a
+    `by:` field (the mapping is the stronger claim)."""
+    srv, calls = await _server(monkeypatch)
+    try:
+        status, _ = await _post(port := _port(srv), "/task", token="mapA",
+                                json={"prompt": "x", "by": "mallory"})
+        assert status == 200
+        assert calls[0]["spawned_by"] == "alby"
+        status, _ = await _post(port, "/task", token="mapB",
+                                json={"prompt": "x"})
+        assert status == 200
+        assert calls[1]["spawned_by"] == "sam"
+        # unknown token — neither map key nor single token → 401
+        status, _ = await _post(port, "/task", token="nope",
+                                json={"prompt": "x"})
+        assert status == 401
+    finally:
+        await srv.stop()
+
+
+async def test_task_by_field_under_single_token(monkeypatch):
+    """Unmapped auth (the bare TASK_INTAKE_TOKEN) takes `by:` as caller
+    identity, defaulting to the 'intake' marker."""
+    srv, calls = await _server(monkeypatch)
+    try:
+        port = _port(srv)
+        status, _ = await _post(port, "/task", token="tok123",
+                                json={"prompt": "x"})
+        assert status == 200
+        assert calls[0]["spawned_by"] == "intake"
+        status, _ = await _post(port, "/task", token="tok123",
+                                json={"prompt": "x", "by": "siri"})
+        assert status == 200
+        assert calls[1]["spawned_by"] == "siri"
+        for bad in (7, "", "a" * 65, ["x"]):
+            status, _ = await _post(
+                port, "/task", token="tok123",
+                json={"prompt": "x", "by": bad},
+            )
+            assert status == 400, bad
     finally:
         await srv.stop()
 
@@ -177,5 +224,6 @@ async def test_maybe_start_token_only(tmp_path):
     # nothing configured at all → no listener
     class _Off(_Settings):
         task_intake_token = ""
+        task_intake_token_map = {}
 
     assert await maybe_start(_Bot(_Off()), None, _Off()) is None  # type: ignore[arg-type]

@@ -11,7 +11,7 @@ from ..acp_bridge import MODEL_ALIASES
 from ..chains import PLAYBOOKS, continued_chain, render_prompt
 from ..db import Binding, ScheduleRow
 from ..digest import build_digest
-from ..embeds import status_embed
+from ..embeds import spawned_by_label, status_embed
 from ..github_client import parse_issue_ref
 from ..inbox import build_inbox_embed
 from ..monitors import parse_watch
@@ -118,7 +118,7 @@ def usage_summary(bindings: list[Binding], now: float) -> dict:
     week0 = int((datetime.fromtimestamp(now) - timedelta(days=7)).timestamp())
     out: dict = {
         "today": 0.0, "week": 0.0, "total": 0.0, "count": len(bindings),
-        "top": [], "by_repo": {},
+        "top": [], "by_repo": {}, "by_user": {},
     }
     for b in bindings:
         out["total"] += b.acus
@@ -130,9 +130,16 @@ def usage_summary(bindings: list[Binding], now: float) -> dict:
         agg = out["by_repo"].setdefault(repo, [0.0, 0])
         agg[0] += b.acus
         agg[1] += 1
+        who = b.spawned_by or "unattributed"
+        uagg = out["by_user"].setdefault(who, [0.0, 0])
+        uagg[0] += b.acus
+        uagg[1] += 1
     out["top"] = sorted(bindings, key=lambda b: b.acus, reverse=True)[:5]
     out["by_repo"] = dict(
         sorted(out["by_repo"].items(), key=lambda kv: kv[1][0], reverse=True)[:8]
+    )
+    out["by_user"] = dict(
+        sorted(out["by_user"].items(), key=lambda kv: kv[1][0], reverse=True)[:8]
     )
     return out
 
@@ -219,6 +226,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 bot, prompt=prompt, repos=repos, model=model, mode=mode,
                 title=title, budget=budget,
                 attachment_urls=[attachment.url] if attachment else None,
+                spawned_by=str(interaction.user.id),
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)
@@ -318,6 +326,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 budget=cap,
                 chain=chain,
                 attachment_urls=[attachment.url] if attachment else None,
+                spawned_by=str(interaction.user.id),
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)
@@ -415,6 +424,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                     bot, prompt=prompt, repos=[r], model=model, mode=mode,
                     title=f"{title + ' · ' if title else ''}{r}",
                     attachment_urls=[attachment.url] if attachment else None,
+                    spawned_by=str(interaction.user.id),
                 )
                 spawned.append(f"{r} → {thread.mention}")
             except SpawnError as e:
@@ -534,6 +544,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
             watch=watch or "",
             expect=expect or "",
             cooldown_seconds=cooldown_seconds,
+            spawned_by=str(interaction.user.id),
         )
         row.id = await bot.db.add_schedule(row)
         detail = (
@@ -617,6 +628,8 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 # carried chain state keeps the playbook advancing
                 chain=continued_chain(binding.chain, sess),
                 attachment_urls=[attachment.url] if attachment else None,
+                # ownership transfers — the tapper gets the pings now
+                spawned_by=str(interaction.user.id),
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)
@@ -897,6 +910,16 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 ),
                 inline=False,
             )
+        if s["by_user"]:
+            embed.add_field(
+                name="By user",
+                value="\n".join(
+                    f"{spawned_by_label(who)} — "
+                    f"{acus:g} ACU ({n} session{'s' if n > 1 else ''})"
+                    for who, (acus, n) in s["by_user"].items()
+                ),
+                inline=False,
+            )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @tree.command(name="devin-status", description="Refresh a session's status")
@@ -920,6 +943,9 @@ def register_commands(bot: "DevinMobileBot") -> None:
         await interaction.response.defer(ephemeral=True)
         sess = await bot.devin.get_session(binding.session_id)
         await interaction.followup.send(
-            embed=status_embed(sess, fallback_title=binding.title),
+            embed=status_embed(
+                sess, fallback_title=binding.title,
+                spawned_by=binding.spawned_by,
+            ),
             ephemeral=True,
         )

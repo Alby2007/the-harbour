@@ -207,7 +207,8 @@ async def test_advance_auto_spawns_child(tmp_path, monkeypatch):
 
     monkeypatch.setattr(relay_mod, "spawn_session", fake_spawn)
     b = _binding(
-        chain=_chain(auto=True), repos="o/r", model="SWE-2 Max", title="t"
+        chain=_chain(auto=True), repos="o/r", model="SWE-2 Max", title="t",
+        spawned_by="77",
     )
     await db.upsert_binding(b)
     r = _relay(_Bot(), db)
@@ -218,6 +219,9 @@ async def test_advance_auto_spawns_child(tmp_path, monkeypatch):
     assert kw["continued_from"] == "s1"
     assert kw["repos"] == ["o/r"]
     assert kw["model"] == "SWE-2 Max"
+    # chain hops inherit the original spawner — a Continue→ tap doesn't
+    # transfer ownership of a playbook
+    assert kw["spawned_by"] == "77"
     assert kw["chain"]["step"] == 1 and kw["chain"]["spent"] == 2.0
     assert "found x" in kw["prompt"]
     # budget = min(global 25, cap 10 − spent 2) = 8

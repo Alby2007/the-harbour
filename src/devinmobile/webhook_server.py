@@ -26,6 +26,7 @@ from aiohttp import web
 
 from .config import Settings
 from .db import Database, PrRow
+from .embeds import mention_for
 
 if TYPE_CHECKING:
     from .bot.main import DevinMobileBot
@@ -39,6 +40,9 @@ class WebhookServer:
         self.db = db
         self.secret = settings.github_webhook_secret.encode()
         self.task_token = settings.task_intake_token
+        # token → caller-name map (TASK_INTAKE_TOKENS) — a mapped token's
+        # session attributes to the name instead of the bare "intake"
+        self.task_token_map = settings.task_intake_token_map
         self.port = settings.github_webhook_port
         self._runner: web.AppRunner | None = None
 
@@ -54,7 +58,7 @@ class WebhookServer:
         if self.secret:
             app.router.add_post("/github", self._handle)
             routes.append("/github")
-        if self.task_token:
+        if self.task_token or self.task_token_map:
             app.router.add_post("/task", self._handle_task)
             routes.append("/task")
         self._runner = web.AppRunner(app)
@@ -70,7 +74,18 @@ class WebhookServer:
         auth = request.headers.get("Authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
         # bytes compare_digest — a non-ASCII bearer would TypeError on str
-        if not hmac.compare_digest(token.encode(), self.task_token.encode()):
+        mapped = next(
+            (
+                name
+                for t, name in self.task_token_map.items()
+                if hmac.compare_digest(token.encode(), t.encode())
+            ),
+            None,
+        )
+        if mapped is None and not (
+            self.task_token
+            and hmac.compare_digest(token.encode(), self.task_token.encode())
+        ):
             return web.Response(status=401)
         try:
             payload = await request.json()
@@ -133,6 +148,16 @@ class WebhookServer:
             attachment_urls = raw_atts or None  # [] == absent
         else:
             return web.Response(status=400)
+        # spawned_by precedence: token-map name → `by:` field → "intake".
+        # A mapped token IGNORES by: — the mapping is the stronger claim,
+        # so the field isn't even validated under it.
+        spawned_by = mapped if mapped is not None else "intake"
+        if mapped is None:
+            by = payload.get("by")
+            if by is not None:
+                if not isinstance(by, str) or not by.strip() or len(by) > 64:
+                    return web.Response(status=400)
+                spawned_by = by.strip()
         from .spawn import SpawnError, spawn_session  # local: import cycle
 
         try:
@@ -143,6 +168,7 @@ class WebhookServer:
                 title=title,
                 budget=budget_f,
                 attachment_urls=attachment_urls,
+                spawned_by=spawned_by,
             )
         except SpawnError as e:
             return web.json_response({"error": str(e)}, status=502)
@@ -269,7 +295,7 @@ class WebhookServer:
         try:
             _, thread = await spawn_session(
                 self.bot, prompt=prompt, repos=[f"{owner}/{name}"],
-                title=title,
+                title=title, spawned_by="github",
             )
             await thread.send(
                 f"Spawned by `{label}` label on {owner}/{name}#{issue['number']}."
@@ -314,6 +340,7 @@ class WebhookServer:
             _, thread = await spawn_session(
                 self.bot, prompt=prompt, repos=[f"{owner}/{name}"],
                 title=f"Review {name}#{number}", review_of=key,
+                spawned_by="github",
             )
             await thread.send(
                 f"Spawned by `{label}` label on {key} — review findings will "
@@ -381,8 +408,9 @@ class WebhookServer:
                 return
             prefix = ""
             if mention:
-                prefix = " ".join(
-                    f"<@{u}>" for u in self.bot.settings.allowed_user_id_set
+                prefix = mention_for(
+                    binding.spawned_by,
+                    self.bot.settings.allowed_user_id_set,
                 ) + " "
             await chan.send(prefix + text, view=view or discord.utils.MISSING)
         except Exception:
@@ -393,7 +421,8 @@ async def maybe_start(
     bot: DevinMobileBot, db: Database, settings: Settings
 ) -> WebhookServer | None:
     want_github = settings.github_enabled and settings.github_webhook_secret
-    if not (want_github or settings.task_intake_token):
+    if not (want_github or settings.task_intake_token
+            or settings.task_intake_token_map):
         return None
     srv = WebhookServer(bot, db, settings)
     try:
