@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 import discord
 
 from .digest import build_digest
+from .inbox import build_inbox_embed
+from .monitors import run_check
 from .spawn import SpawnError, spawn_session
 
 if TYPE_CHECKING:
@@ -56,6 +58,12 @@ class Scheduler:
             if s.kind == "digest":
                 await self._fire_digest(s, now)
                 continue
+            if s.kind == "monitor":
+                await self._fire_monitor(s, now)
+                continue
+            if s.kind == "inbox":
+                await self._fire_inbox(s, now)
+                continue
             try:
                 session, thread = await spawn_session(
                     self.bot,
@@ -83,14 +91,7 @@ class Scheduler:
         try:
             since = now - s.interval_seconds
             bindings = await self.bot.db.bindings_since(since)
-            hub_id = self.bot.settings.hub_channel_id
-            chan = (
-                self.bot.get_channel(hub_id)
-                or await self.bot.fetch_channel(hub_id)
-            ) if hub_id is not None else None
-            if isinstance(chan, discord.abc.Messageable):
-                await chan.send(embed=build_digest(bindings, since))
-            else:
+            if not await self._post_hub(embed=build_digest(bindings, since)):
                 # silent no-op otherwise: a digest schedule with no hub
                 # would fire forever with zero trace of why nothing posts
                 log.warning(
@@ -101,3 +102,91 @@ class Scheduler:
             log.exception("schedule #%d digest crashed", s.id)
         finally:
             await self.bot.db.schedule_ran(s.id, "", now)
+
+    async def _fire_monitor(self, s, now: int) -> None:
+        """monitor-kind row — cheap check each tick, spawn only on a red
+        edge (or a still-red cooldown expiry), never while the previous
+        fix session is still running. `unknown` (GitHub/API outage,
+        malformed watch) is never red."""
+        # schedule_ran writes last_session_id — keep the prior pointer on
+        # non-spawn paths; it's the still-running dedup key.
+        fired_id = s.last_session_id or ""
+        try:
+            result = await run_check(s.watch, s.expect, self.bot.github)
+            if result.state == "unknown":
+                log.warning(
+                    "monitor #%d %s unknown: %s", s.id, s.watch, result.detail
+                )
+            elif result.state == "ok":
+                if s.watch_state == "red":
+                    await self._post_hub(
+                        f"✅ Monitor recovered: `{s.watch}` — {result.detail}"
+                    )
+                await self.bot.db.update_watch(s.id, "green")
+            else:  # red
+                edge = s.watch_state != "red"
+                cooled = (
+                    s.last_fired_at is None
+                    or now - s.last_fired_at >= s.cooldown_seconds
+                )
+                still_running = False
+                if s.last_session_id:
+                    prev = await self.bot.db.get_binding(s.last_session_id)
+                    still_running = bool(prev and prev.active)
+                if (edge or cooled) and not still_running:
+                    session, thread = await spawn_session(
+                        self.bot,
+                        prompt=(
+                            f"{s.prompt}\n\n---\nMonitor tripped: {s.watch} "
+                            f"→ {result.detail} at <t:{now}:F>"
+                        ),
+                        repos=s.repos or None,
+                        model=s.model,
+                        title=f"[monitor] {s.watch[:60]}",
+                    )
+                    await thread.send(
+                        f"Spawned by monitor schedule #{s.id} "
+                        f"(`{s.watch}` → {result.detail})."
+                    )
+                    await self.bot.db.update_watch(s.id, "red", now)
+                    fired_id = session.session_id
+                else:
+                    # still red but suppressed — persist state only
+                    log.info(
+                        "monitor #%d %s red — suppressed (edge=%s cooled=%s "
+                        "running=%s)",
+                        s.id, s.watch, edge, cooled, still_running,
+                    )
+                    await self.bot.db.update_watch(s.id, "red")
+        except SpawnError as e:
+            log.warning("monitor #%d spawn failed: %s", s.id, e)
+        except Exception:
+            log.exception("monitor #%d crashed", s.id)
+        finally:
+            await self.bot.db.schedule_ran(s.id, fired_id, now)
+
+    async def _fire_inbox(self, s, now: int) -> None:
+        """inbox-kind row → the prospective triage card, posted to hub on
+        a daily cadence. Same slide-forward semantics."""
+        try:
+            embed = await build_inbox_embed(self.bot.db)
+            if not await self._post_hub(embed=embed):
+                log.warning(
+                    "inbox schedule #%d: hub channel unresolvable "
+                    "(HUB_CHANNEL_ID unset or wrong?)", s.id
+                )
+        except Exception:
+            log.exception("inbox schedule #%d crashed", s.id)
+        finally:
+            await self.bot.db.schedule_ran(s.id, "", now)
+
+    async def _post_hub(self, text: str = "", **kw) -> bool:
+        hub_id = self.bot.settings.hub_channel_id
+        chan = (
+            self.bot.get_channel(hub_id)
+            or await self.bot.fetch_channel(hub_id)
+        ) if hub_id is not None else None
+        if not isinstance(chan, discord.abc.Messageable):
+            return False
+        await chan.send(text or discord.utils.MISSING, **kw)
+        return True

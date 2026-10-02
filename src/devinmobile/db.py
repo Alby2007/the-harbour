@@ -61,7 +61,12 @@ CREATE TABLE IF NOT EXISTS schedules (
     next_run_at      INTEGER NOT NULL,
     enabled          INTEGER NOT NULL DEFAULT 1,
     last_session_id  TEXT,
-    kind             TEXT NOT NULL DEFAULT 'spawn',  -- spawn | digest
+    kind             TEXT NOT NULL DEFAULT 'spawn',  -- spawn | digest | monitor | inbox
+    watch            TEXT,          -- monitor: https://… or ci:owner/repo[@branch]
+    expect           TEXT,          -- monitor: required substring in URL body
+    watch_state      TEXT NOT NULL DEFAULT '',  -- '' | green | red (last observed)
+    last_fired_at    INTEGER,       -- monitor: last spawn (cooldown math)
+    cooldown_seconds INTEGER NOT NULL DEFAULT 14400,  -- still-red re-fire floor
     created_at       INTEGER NOT NULL
 );
 
@@ -120,9 +125,24 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         ),
     },
     "schedules": {
-        # 'spawn' (default) fires spawn_session; 'digest' posts a rollup
+        # 'spawn' (default) fires spawn_session; 'digest' posts a rollup;
+        # 'monitor' checks first, spawns on a red edge; 'inbox' posts the
+        # triage card
         "kind": (
             "ALTER TABLE schedules ADD COLUMN kind TEXT NOT NULL DEFAULT 'spawn'"
+        ),
+        "watch": "ALTER TABLE schedules ADD COLUMN watch TEXT",
+        "expect": "ALTER TABLE schedules ADD COLUMN expect TEXT",
+        "watch_state": (
+            "ALTER TABLE schedules ADD COLUMN "
+            "watch_state TEXT NOT NULL DEFAULT ''"
+        ),
+        "last_fired_at": (
+            "ALTER TABLE schedules ADD COLUMN last_fired_at INTEGER"
+        ),
+        "cooldown_seconds": (
+            "ALTER TABLE schedules ADD COLUMN "
+            "cooldown_seconds INTEGER NOT NULL DEFAULT 14400"
         ),
     },
 }
@@ -168,7 +188,12 @@ class ScheduleRow:
     next_run_at: int = 0
     enabled: bool = True
     last_session_id: str | None = None
-    kind: str = "spawn"  # 'spawn' fires a session; 'digest' posts a rollup
+    kind: str = "spawn"  # spawn | digest | monitor | inbox
+    watch: str = ""  # monitor: https://… URL or ci:owner/repo[@branch]
+    expect: str = ""  # monitor: substring the URL body must contain
+    watch_state: str = ""  # '' | green | red — last observed, for edges
+    last_fired_at: int | None = None  # monitor: cooldown anchor
+    cooldown_seconds: int = 14400  # still-red re-fire floor (4h)
     created_at: int = 0
 
 
@@ -521,6 +546,11 @@ class Database:
             next_run_at=row["next_run_at"], enabled=bool(row["enabled"]),
             last_session_id=row["last_session_id"],
             kind=row["kind"] or "spawn",
+            watch=row["watch"] or "",
+            expect=row["expect"] or "",
+            watch_state=row["watch_state"] or "",
+            last_fired_at=row["last_fired_at"],
+            cooldown_seconds=row["cooldown_seconds"] or 14400,
             created_at=row["created_at"],
         )
 
@@ -531,11 +561,13 @@ class Database:
         cur = await self._conn.execute(
             """INSERT INTO schedules
                (prompt, repos, model, interval_seconds, next_run_at, enabled,
-                last_session_id, kind, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                last_session_id, kind, watch, expect, watch_state,
+                last_fired_at, cooldown_seconds, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (s.prompt, json.dumps(s.repos), s.model, s.interval_seconds,
              s.next_run_at, int(s.enabled), s.last_session_id, s.kind,
-             s.created_at),
+             s.watch or None, s.expect or None, s.watch_state,
+             s.last_fired_at, s.cooldown_seconds, s.created_at),
         )
         await self._conn.commit()
         return cur.lastrowid or 0
@@ -571,6 +603,74 @@ class Database:
         )
         await self._conn.commit()
         return (cur.rowcount or 0) > 0
+
+    async def update_watch(
+        self, schedule_id: int, state: str, last_fired_at: int | None = None
+    ) -> None:
+        """Monitor bookkeeping — watch_state edge detection + the cooldown
+        anchor. last_fired_at=None keeps the previous value."""
+        await self._conn.execute(
+            """UPDATE schedules SET
+                 watch_state = ?,
+                 last_fired_at = COALESCE(?, last_fired_at)
+               WHERE id = ?""",
+            (state, last_fired_at, schedule_id),
+        )
+        await self._conn.commit()
+
+    # ---- inbox ------------------------------------------------------------
+
+    async def inbox_bindings(self) -> list[Binding]:
+        """Rows the triage card might care about: still-polling, errored, or
+        carrying chain state (pending-Continue rows). Python-side filters
+        do the sectioning — the query is deliberately broad."""
+        async with self._conn.execute(
+            """SELECT * FROM bindings
+               WHERE active = 1 OR status = 'error'
+                  OR (chain IS NOT NULL AND chain != '')
+               ORDER BY created_at DESC"""
+        ) as cur:
+            return [self._row_to_binding(r) for r in await cur.fetchall()]
+
+    async def continued_parents(self) -> set[str]:
+        """Session ids that already produced a continuation child — an
+        errored session with a respawn/`/continue` child isn't inbox work."""
+        async with self._conn.execute(
+            "SELECT DISTINCT continued_from FROM bindings"
+            " WHERE continued_from IS NOT NULL AND continued_from != ''"
+        ) as cur:
+            return {r[0] for r in await cur.fetchall()}
+
+    async def open_prs(self) -> list[PrRow]:
+        async with self._conn.execute(
+            "SELECT * FROM prs WHERE state = 'open' ORDER BY updated_at DESC"
+        ) as cur:
+            return [self._row_to_pr(r) for r in await cur.fetchall()]
+
+    async def idle_repos(self, since: int, limit: int = 5) -> list[str]:
+        """Repos we know (notes or PR history) with NO binding activity in
+        the window — the inbox-zero 'habit nudge' suggestions."""
+        async with self._conn.execute(
+            "SELECT DISTINCT repo FROM repo_notes"
+        ) as cur:
+            known = {r[0] for r in await cur.fetchall()}
+        async with self._conn.execute(
+            "SELECT DISTINCT owner || '/' || repo FROM prs"
+            " WHERE owner != '' AND repo != ''"
+        ) as cur:
+            known |= {r[0] for r in await cur.fetchall()}
+        async with self._conn.execute(
+            """SELECT repos FROM bindings
+               WHERE COALESCE(last_activity_at, created_at) >= ?""",
+            (since,),
+        ) as cur:
+            busy = {
+                repo.strip()
+                for (csv,) in await cur.fetchall()
+                for repo in (csv or "").split(",")
+                if repo.strip()
+            }
+        return sorted(known - busy)[:limit]
 
     # ---- repo notes ---------------------------------------------------------
 

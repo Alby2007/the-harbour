@@ -52,7 +52,16 @@ Recurring sessions — the task queue that runs while you sleep.
 | `recipe` | optional, choice | Canned maintenance loop: `dep-audit` (outdated + vulnerable deps → upgrade PR), `test-coverage` (coverage gaps → test PR), `security-scan` (scanners + secrets/auth audit → severity report). A `prompt:` given alongside is appended to the recipe |
 | `repo` | optional, autocomplete | Repo(s) for each run |
 | `model` | optional | Model alias (bridge) |
-| `kind` | optional, choice | `spawn` (default) runs the prompt; `digest` posts a rollup of what Devin did in the window to the hub channel instead — `/schedule kind:digest every:1d` is the nightly standup |
+| `kind` | optional, choice | `spawn` (default) runs the prompt; `digest` posts the window rollup; `inbox` posts the triage card; `monitor` checks first and only spawns your `prompt:` when the check goes red |
+| `watch` | monitor only | What to check each interval: `https://…` URL (non-2xx, unreachable, or missing `expect:` = red) or `ci:owner/repo[@branch]` (CI rollup — needs the GitHub App) |
+| `expect` | monitor only | Substring the URL body must contain (URL watches only) |
+| `cooldown` | monitor only | Still-red re-fire floor, `30m`/`4h`/`1d` syntax (default 4h). A red edge always fires once; a persistently-down target refires at most once per cooldown, and never while its previous fix session is still running |
+
+`kind:monitor` turns the scheduler into a monitoring layer — the spawn is
+"session investigates", not "page a human". A transport failure and a
+bot-host network outage both read red (bounded to one spawn per edge); a
+GitHub API failure on a `ci:` watch reads `unknown` and never spawns.
+Green-after-red posts a ✅ recovery line to the hub channel.
 
 Rows persist in SQLite and survive restarts. A downtime doesn't
 catch-fire the backlog — `next_run_at` slides forward from the actual fire
@@ -68,6 +77,25 @@ at completion, so no API calls — sessions that finished before this
 feature landed show title-only. A session counts if it had activity in
 the window or is still polling — a long silent run doesn't fall out.
 A session active across two windows appears in both.
+
+### `/inbox`
+
+The prospective counterpart to `/digest` — a triage card of everything
+waiting on a human, urgency-ordered:
+
+1. **Waiting on you** — sessions at `waiting_for_user`/`waiting_for_approval`
+   (question excerpts when the last message ends in `?`)
+2. **Errored** — sessions that died without producing a continuation
+3. **Chains awaiting Continue →** — human-gated playbook phases
+4. **Monitors red** — `kind:monitor` schedules currently failing
+5. **Open PRs** — tracked PRs with CI state (+ `armed` when auto-merge
+   is on)
+
+Each row links to its thread — the action buttons already live there.
+Empty → "inbox zero" plus up to two idle-repo suggestions (repos we know
+from notes/PRs with no session activity in 7d). `/schedule kind:inbox
+every:1d` posts the card to the hub channel daily — the morning
+touchpoint.
 
 ### `/continue`
 

@@ -155,7 +155,24 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   (digest.py) to the hub channel instead of spawning; `bindings.summary`
   is captured from `structured_output.summary` in `_notify`'s complete
   branch so digests stay a local read (`bindings_since` window via
-  `COALESCE(last_activity_at, created_at)`).
+  `COALESCE(last_activity_at, created_at) OR active`).
+- `kind='monitor'` schedules (`monitors.py::run_check` +
+  `scheduler._fire_monitor`): `watch` is `https://…` (non-2xx / transport
+  error / missing `expect` substring = red — a DOWN endpoint is the
+  signal, and a bot-host network outage reads the same) or
+  `ci:owner/repo[@branch]` (check-runs rollup; API failure = `unknown`,
+  NEVER red — a flaky GitHub API can't spawn-storm). Spawns ride edge +
+  cooldown + still-running dedup: `watch_state != 'red'` OR
+  `last_fired_at` past `cooldown_seconds`, AND the `last_session_id`
+  binding isn't active. `finally: schedule_ran` always advances; the
+  `last_session_id` pointer is preserved on non-spawn ticks (it's the
+  dedup key). Green-after-red posts a recovery line to hub.
+- `kind='inbox'` + `/inbox` (`inbox.py`): read-only aggregation —
+  `inbox_bindings()` is deliberately broad (active OR errored OR
+  chain-carrying); `build_inbox` does sectioning. Errored sessions with
+  a `continued_from` child are suppressed (`continued_parents`). Inbox
+  zero suggests `idle_repos` (known repos with no activity in 7d). Rows
+  link to threads — actions already live there, no cross-item buttons.
 - `webhook_server.py` routes register per credential: `/github` when the
   HMAC secret is set, `/task` when `TASK_INTAKE_TOKEN` is set; the server
   starts if either exists. `/task` is bearer auth (`hmac.compare_digest`)

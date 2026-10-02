@@ -212,6 +212,15 @@ class GithubClient:
         )
         return checks_state(runs.get("check_runs", []))
 
+    async def get_ref_checks(self, owner: str, repo: str, ref: str) -> str:
+        """Combined CI state for any ref (branch/sha) — backs ci: monitors.
+        success|failure|pending|none; API errors raise (caller maps to
+        'unknown', not red)."""
+        runs = await self._req(
+            "GET", f"/repos/{owner}/{repo}/commits/{ref}/check-runs"
+        )
+        return checks_state(runs.get("check_runs", []))
+
     async def get_failed_checks(self, pr: PullRef) -> list[dict[str, Any]]:
         """Check runs that ended badly on the PR head — feeds the Fix-CI
         button's message to Devin. Logs aren't fetched (huge); the html_url

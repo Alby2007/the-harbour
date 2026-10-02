@@ -13,6 +13,8 @@ from ..db import Binding, ScheduleRow
 from ..digest import build_digest
 from ..embeds import status_embed
 from ..github_client import parse_issue_ref
+from ..inbox import build_inbox_embed
+from ..monitors import parse_watch
 from ..spawn import SpawnError, spawn_session
 
 if TYPE_CHECKING:
@@ -430,12 +432,17 @@ def register_commands(bot: "DevinMobileBot") -> None:
         repo="org/repo (comma-separate for several)",
         model="Model picker (optional)",
         kind="spawn = run the prompt; digest = post the window rollup",
+        watch="monitor kind: https://… URL or ci:owner/repo[@branch]",
+        expect="monitor kind: substring the URL body must contain",
+        cooldown="monitor kind: still-red re-fire floor (default 4h)",
     )
     @app_commands.choices(
         recipe=[app_commands.Choice(name=k, value=k) for k in RECIPES],
         kind=[
             app_commands.Choice(name="spawn", value="spawn"),
             app_commands.Choice(name="digest", value="digest"),
+            app_commands.Choice(name="monitor", value="monitor"),
+            app_commands.Choice(name="inbox", value="inbox"),
         ],
     )
     @app_commands.autocomplete(model=model_autocomplete, repo=repo_autocomplete)
@@ -448,18 +455,53 @@ def register_commands(bot: "DevinMobileBot") -> None:
         repo: str | None = None,
         model: str | None = None,
         kind: str | None = None,
+        watch: str | None = None,
+        expect: str | None = None,
+        cooldown: str | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         kind = kind or "spawn"
-        if kind == "digest":
+        if kind in {"digest", "inbox"}:
             # prompt is just a label — the rollup covers ALL activity in
             # the window, so spawn params would be silently ignored
-            prompt = prompt or "digest"
+            prompt = prompt or kind
             repo = model = recipe = None
+            watch = expect = cooldown = None
         elif recipe:
             prompt = f"{RECIPES[recipe]}\n\n{prompt}" if prompt else RECIPES[recipe]
+        if kind == "monitor":
+            parsed = parse_watch(watch or "")
+            if parsed is None:
+                await interaction.response.send_message(
+                    "`watch:` must be `https://…` or `ci:owner/repo[@branch]`.",
+                    ephemeral=True,
+                )
+                return
+            if expect and parsed[0] != "url":
+                await interaction.response.send_message(
+                    "`expect:` only applies to URL watches.", ephemeral=True
+                )
+                return
+            if parsed[0] == "ci" and not bot.settings.github_enabled:
+                await interaction.response.send_message(
+                    "`ci:` watches need the GitHub App (GITHUB_APP_*).",
+                    ephemeral=True,
+                )
+                return
+            if not prompt:
+                await interaction.response.send_message(
+                    "A monitor needs a `prompt:` — the fix instructions "
+                    "when the check goes red.", ephemeral=True,
+                )
+                return
+        if kind != "monitor" and (watch or expect or cooldown):
+            await interaction.response.send_message(
+                "`watch:`/`expect:`/`cooldown:` only apply to `kind:monitor`.",
+                ephemeral=True,
+            )
+            return
         if not prompt:
             await interaction.response.send_message(
                 "Give a `prompt:` or pick a `recipe:`.", ephemeral=True
@@ -471,6 +513,16 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 "Interval must be like `30m`, `6h`, `1d` (min 5m).", ephemeral=True
             )
             return
+        cooldown_seconds = 14400
+        if cooldown:
+            cd = parse_every(cooldown)
+            if cd is None or cd < 300:
+                await interaction.response.send_message(
+                    "`cooldown:` must be like `30m`, `4h`, `1d` (min 5m).",
+                    ephemeral=True,
+                )
+                return
+            cooldown_seconds = cd
         row = ScheduleRow(
             id=0,
             prompt=prompt,
@@ -479,11 +531,19 @@ def register_commands(bot: "DevinMobileBot") -> None:
             interval_seconds=interval,
             next_run_at=int(time.time()) + interval,
             kind=kind,
+            watch=watch or "",
+            expect=expect or "",
+            cooldown_seconds=cooldown_seconds,
         )
         row.id = await bot.db.add_schedule(row)
         detail = (
             "posts the activity rollup to the hub channel"
             if kind == "digest"
+            else "posts the triage card to the hub channel"
+            if kind == "inbox"
+            else f"watches `{watch}` — spawns only on a red edge "
+                 f"(cooldown {cooldown_seconds // 60}m)"
+            if kind == "monitor"
             else f"`{prompt[:80]}` on {', '.join(row.repos) or 'default repos'}"
         )
         await interaction.response.send_message(
@@ -581,11 +641,19 @@ def register_commands(bot: "DevinMobileBot") -> None:
         for s in rows:
             state = "on" if s.enabled else "off"
             due = "due now" if s.next_run_at <= now else f"next <t:{s.next_run_at}:R>"
-            tag = " · digest" if s.kind == "digest" else ""
+            tag = f" · {s.kind}" if s.kind != "spawn" else ""
+            watch_state = (
+                f" ({s.watch_state})" if s.kind == "monitor" and s.watch_state
+                else ""
+            )
             embed.add_field(
                 name=f"#{s.id} · every {s.interval_seconds // 60}m · {state}{tag}",
                 value=(
-                    f"`{s.prompt[:80]}`\n{', '.join(s.repos) or 'default repos'} · {due}"
+                    f"`{s.watch}{watch_state}` watches → `{s.prompt[:60]}`"
+                    f"\n{due}"
+                    if s.kind == "monitor"
+                    else f"`{s.prompt[:80]}`\n"
+                    f"{', '.join(s.repos) or 'default repos'} · {due}"
                 ),
                 inline=False,
             )
@@ -623,6 +691,19 @@ def register_commands(bot: "DevinMobileBot") -> None:
         since = int(time.time()) - hours * 3600
         embed = build_digest(await bot.db.bindings_since(since), since)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(
+        name="inbox",
+        description="Triage card — everything waiting on a human tap",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def inbox_cmd(interaction: discord.Interaction) -> None:
+        if not _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=await build_inbox_embed(bot.db), ephemeral=True
+        )
 
     @tree.command(
         name="note",

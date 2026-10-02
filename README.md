@@ -57,6 +57,14 @@ approval → anything you type in the thread steers the session.
 - **Digest** — `/digest` and `/schedule kind:digest` roll up what Devin
   did in a window (grouped by outcome, per-session summary + ACU) from
   summaries persisted at completion — a local read, no API calls
+- **Monitors** — `/schedule kind:monitor watch:https://…` (or
+  `ci:owner/repo`) checks each interval and spawns a fix session only on
+  a red edge — cooldown + still-running dedup keep a hard-down target to
+  one session per window; green-after-red posts a recovery note
+- **Inbox** — `/inbox` (and `/schedule kind:inbox every:1d`) is the
+  morning triage card: sessions waiting on you, errored runs, chains
+  paused at Continue→, red monitors, and open PRs with CI state — each
+  row links into the thread where the buttons already live
 - **Attachments everywhere** — `/devin`/`/continue`/`/chain` take a native
   `attachment:` file picker; `/task` accepts `attachments` URLs; and a DM
   photo (or voice note, Whisper-transcribed) with a caption spawns a
