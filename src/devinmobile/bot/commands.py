@@ -151,6 +151,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         mode="Agent mode (default from env)",
         title="Thread/session title",
         budget="Per-task ACU cap — session parks when burn reaches it",
+        attachment="Photo/file to attach (screenshot, log, spec)",
     )
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in DEVIN_MODES])
     @app_commands.autocomplete(model=model_autocomplete, repo=repo_autocomplete)
@@ -165,6 +166,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         mode: str | None = None,
         title: str | None = None,
         budget: int | None = None,
+        attachment: discord.Attachment | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
@@ -214,6 +216,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
             session, thread = await spawn_session(
                 bot, prompt=prompt, repos=repos, model=model, mode=mode,
                 title=title, budget=budget,
+                attachment_urls=[attachment.url] if attachment else None,
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)
@@ -231,6 +234,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         budget="Chain-wide ACU cap (default: MAX_ACU_LIMIT × phases)",
         auto="Run every phase without tapping Continue (default: ask at mutating phases)",
         title="Thread title prefix",
+        attachment="Photo/file for the first phase only",
     )
     @app_commands.choices(
         playbook=[app_commands.Choice(name=k, value=k) for k in PLAYBOOKS]
@@ -245,6 +249,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         budget: float | None = None,
         auto: bool = False,
         title: str | None = None,
+        attachment: discord.Attachment | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
@@ -310,6 +315,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 title=base_title,
                 budget=cap,
                 chain=chain,
+                attachment_urls=[attachment.url] if attachment else None,
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)
@@ -376,6 +382,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         model="Model picker — overrides mode",
         mode="Agent mode (default from env)",
         title="Thread title prefix",
+        attachment="Photo/file attached to every spawned session",
     )
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in DEVIN_MODES])
     @app_commands.autocomplete(model=model_autocomplete, repos=repo_autocomplete)
@@ -387,6 +394,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         model: str | None = None,
         mode: str | None = None,
         title: str | None = None,
+        attachment: discord.Attachment | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
@@ -404,6 +412,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 _, thread = await spawn_session(
                     bot, prompt=prompt, repos=[r], model=model, mode=mode,
                     title=f"{title + ' · ' if title else ''}{r}",
+                    attachment_urls=[attachment.url] if attachment else None,
                 )
                 spawned.append(f"{r} → {thread.mention}")
             except SpawnError as e:
@@ -487,10 +496,15 @@ def register_commands(bot: "DevinMobileBot") -> None:
         name="continue",
         description="Continue this session's work in a fresh session",
     )
-    @app_commands.describe(notes="Extra instructions for the continuation")
+    @app_commands.describe(
+        notes="Extra instructions for the continuation",
+        attachment="Fresh screenshot/file for the continuation",
+    )
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def continue_cmd(
-        interaction: discord.Interaction, notes: str | None = None
+        interaction: discord.Interaction,
+        notes: str | None = None,
+        attachment: discord.Attachment | None = None,
     ) -> None:
         if not _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
@@ -542,6 +556,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
                 # a chain phase's /continue child IS the phase retry —
                 # carried chain state keeps the playbook advancing
                 chain=continued_chain(binding.chain, sess),
+                attachment_urls=[attachment.url] if attachment else None,
             )
         except SpawnError as e:
             await interaction.followup.send(str(e), ephemeral=True)

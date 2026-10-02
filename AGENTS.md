@@ -162,6 +162,22 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   → `spawn_session` → returns `thread_url` (the Discord deep-link that
   makes Siri/Raycast intake useful). Same trust model as the webhook
   secret — no extra hardening beyond it.
+- Attachments funnel through `spawn_session(attachment_urls=)`: `/devin`,
+  `/devin-all`, `/continue`, `/chain` (phase 0 only) expose a native
+  `attachment:` file option, `/task` takes `attachments` URLs, and DMs
+  forward message attachments. v3 passes them as `attachment_urls`; the
+  bridge path inlines them as `Attachments:` URL lines in the prompt (ACP
+  resource_link blocks unverified — probe pending). Discord CDN URLs
+  expire ~24h → NEVER on `/schedule` (a delayed spawn would deliver dead
+  links).
+- DM intake (`main._dm_intake`): `message.guild is None` → `devin:`
+  prefix (any text), attachment (caption or default analyze prompt), or
+  voice note (Whisper, `from_voice` flag). A caption + voice note merges
+  `transcript\n\ncaption` — a `.ogg` URL is useless to Devin, so a
+  consumed voice file NEVER rides as an attachment (thread path same).
+  Bare non-prefixed text → one-line hint; non-allowlisted → silence.
+  Prefix strips before the voice merge so a dictated "devin: …"
+  transcript works.
 - Webhook `_post` takes `view=`; fake test channels must accept `**kw`.
 - Voice steering: `message.attachments` with `audio/*` (or `.waveform`)
   transcribe via Whisper when `OPENAI_API_KEY` is set; the transcript

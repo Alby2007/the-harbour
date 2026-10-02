@@ -90,6 +90,13 @@ class Scheduler:
             ) if hub_id is not None else None
             if isinstance(chan, discord.abc.Messageable):
                 await chan.send(embed=build_digest(bindings, since))
+            else:
+                # silent no-op otherwise: a digest schedule with no hub
+                # would fire forever with zero trace of why nothing posts
+                log.warning(
+                    "digest schedule #%d: hub channel unresolvable "
+                    "(HUB_CHANNEL_ID unset or wrong?)", s.id
+                )
         except Exception:
             log.exception("schedule #%d digest crashed", s.id)
         finally:

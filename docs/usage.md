@@ -18,6 +18,7 @@ Creates a session and its thread.
 | `mode` | optional | v3 `devin_mode` tier — `lite`/`normal`/`fast`/`ultra`/`fusion`. Ignored when `model:` is set (the model select supersedes it). Beats `DEVIN_DEFAULT_MODEL` when passed explicitly |
 | `title` | optional | Thread/session title; defaults to the prompt (or the issue title when `issue:` is set) |
 | `budget` | optional | Per-task ACU cap. At 100% the session is parked on our side (and v3's own `max_acu_limit` stops it server-side on the v3 path). Overrides `MAX_ACU_LIMIT` for this session's 80%/100% pings |
+| `attachment` | optional | Photo/file to seed the session with (screenshot, log, spec). Sent to v3 as `attachment_urls`; on `model:` bridge spawns the URL is inlined into the prompt instead |
 
 `DEVIN_DEFAULT_MODEL` (env) applies a model to every `/devin` call that passes
 neither `model:` nor `mode:`. Option order in Discord is fixed — required
@@ -38,6 +39,7 @@ Fan-out: one session per repo, one thread each.
 | `prompt` | required | The task, run once per repo |
 | `repos` | required, autocomplete | Comma-separated `owner/repo` list (2+) |
 | `model` / `mode` / `title` | optional | Same semantics as `/devin`; `title` becomes a prefix (`title · repo`) |
+| `attachment` | optional | Photo/file attached to **every** spawned session |
 
 ### `/schedule`
 
@@ -73,7 +75,8 @@ Run inside a finished/errored/suspended session's thread: spawns a fresh
 session seeded with the old one's `structured_output` summary, files
 touched, repo(s), model, and budget — plus your `notes:` if given. The old
 thread links to the new one. Sessions still `running` are refused — reply
-to steer instead.
+to steer instead. `attachment:` seeds the continuation with a fresh
+screenshot/file.
 
 ### `/chain`
 
@@ -90,6 +93,7 @@ completion card links to the next.
 | `budget` | optional | **Chain-wide** ACU cap rolled across all phases (default: `MAX_ACU_LIMIT` × phase count) |
 | `auto` | optional | `yes` runs every phase without asking; default pauses before mutating phases |
 | `title` | optional | Thread title prefix (`title · phase-name`) |
+| `attachment` | optional | Photo/file — rides into the phase-0 spawn only |
 
 **Playbooks**
 
@@ -204,11 +208,33 @@ curl -X POST https://<host>/task \
 ```
 
 Body: `prompt` (required, ≤4000 chars), `repo` (string or array,
-comma-separate works), `title`, `budget` (ACU cap). Success → `200` with
-`session_id`, `thread_id`, `session_url`, and `thread_url` — the Discord
-deep-link is what makes a Shortcut useful (tap → lands in the live
-thread). Errors: `401` bad/missing token, `400` bad body, `502` spawn
-failure.
+comma-separate works), `title`, `budget` (ACU cap), `attachments` (array
+of ≤8 `http(s)://` URLs, each ≤2048 chars — they must be publicly
+fetchable by Devin). Success → `200` with `session_id`, `thread_id`,
+`session_url`, and `thread_url` — the Discord deep-link is what makes a
+Shortcut useful (tap → lands in the live thread). Errors: `401`
+bad/missing token, `400` bad body, `502` spawn failure.
+
+## DM intake
+
+The bot's DM is itself an intake surface — the lowest-friction phone path:
+
+- **Photo/file + caption** — the caption is the prompt; the file rides as
+  `attachment_urls`.
+- **Photo/file, no caption** — a default "analyze these and report what
+  you find" prompt.
+- **`devin: <task>`** — text-only spawn (case-insensitive prefix).
+- **Voice note** — transcribed via Whisper into the prompt (needs
+  `OPENAI_API_KEY`; without it the bot replies why). A caption merges
+  with the transcript (`transcript + caption`); other attachments on the
+  same message still ride along. Without a key, a captioned voice note
+  spawns from the caption alone and the bot says the audio was skipped —
+  a bare `.ogg` URL is useless to Devin, so it's never attached.
+- **Anything else** — a one-line hint, no spawn. Stray chatter stays
+  inert, and non-allowlisted senders get silence.
+
+The reply links into the spawned hub-channel thread (`thread_url`). DMs
+can't host threads — that's why the session still lands in the hub.
 
 ## The thread
 

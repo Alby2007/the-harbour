@@ -198,6 +198,51 @@ async def test_spawn_without_notes_still_nudges(tmp_path, monkeypatch):
     assert "structured_output.repo_notes" in prompt
 
 
+# ---- attachments -----------------------------------------------------------
+
+
+async def test_spawn_forwards_attachment_urls_v3(tmp_path, monkeypatch):
+    import discord
+
+    db = await _db(tmp_path)
+    bot = _SpawnBot(db)
+    monkeypatch.setattr(discord, "TextChannel", _Hub)
+    await spawn_mod.spawn_session(
+        bot, prompt="fix this", attachment_urls=["https://cdn/x.png"]
+    )
+    assert bot.devin.created[0]["attachment_urls"] == ["https://cdn/x.png"]
+
+
+async def test_spawn_bridge_inlines_attachment_urls(tmp_path, monkeypatch):
+    """model: + attachments → URLs-in-prompt (ACP resource blocks are
+    unverified — see plan caveat), never reach create_session."""
+    import discord
+
+    db = await _db(tmp_path)
+    bot = _SpawnBot(db)
+    prompts: list[str] = []
+
+    class _Bridge:
+        available = True
+
+        async def create_cloud_session(self, prompt, model=None, repos=None):
+            prompts.append(prompt)
+            return type("BS", (), {"session_id": "sb", "model_label": "m"})()
+
+    async def _get_session(sid):
+        return Session(session_id=sid, url="u", status="running")
+
+    bot.bridge = _Bridge()
+    bot.devin.get_session = _get_session  # type: ignore[attr-defined]
+    monkeypatch.setattr(discord, "TextChannel", _Hub)
+    await spawn_mod.spawn_session(
+        bot, prompt="fix this", model="opus",
+        attachment_urls=["https://cdn/x.png", "https://cdn/y.png"],
+    )
+    assert not bot.devin.created  # v3 create never ran
+    assert "Attachments:\n- https://cdn/x.png\n- https://cdn/y.png" in prompts[0]
+
+
 # ---- /note /notes /unnote ----------------------------------------------------
 
 

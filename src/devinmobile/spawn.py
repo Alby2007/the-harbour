@@ -57,6 +57,7 @@ async def spawn_session(
     continued_from: str = "",
     review_of: str = "",
     chain: dict | None = None,
+    attachment_urls: list[str] | None = None,
 ) -> tuple[Session, discord.Thread]:
     """Create a Devin session + its Discord thread + binding.
 
@@ -115,6 +116,13 @@ async def spawn_session(
                 "Model selection needs `devin auth login` on the bot host "
                 "(no CLI credentials found). Run without `model:` or log in first."
             )
+        if attachment_urls:
+            # ACP resource_link/image content blocks are unverified against
+            # Devin (probe pending) — URLs-in-prompt is the working path.
+            # Signed Discord CDN links stay fetchable ~24h.
+            prompt += "\n\nAttachments:\n" + "\n".join(
+                f"- {u}" for u in attachment_urls
+            )
         try:
             bs = await bot.bridge.create_cloud_session(
                 prompt, model=effective_model, repos=repos
@@ -137,6 +145,7 @@ async def spawn_session(
                     int(budget) if budget else bot.settings.max_acu_limit
                 ),
                 create_as_user_id=bot.settings.create_as_user_id,
+                attachment_urls=attachment_urls,
             )
         except Exception as e:
             raise SpawnError(f"Session create failed: `{e}`") from e

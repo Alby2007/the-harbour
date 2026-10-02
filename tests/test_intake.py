@@ -97,6 +97,13 @@ async def test_task_intake_happy(monkeypatch):
         })
         assert status == 200
         assert calls[1]["repos"] == ["o/r", "o/r2"]
+        # attachments forward as attachment_urls; absent → None
+        status, _ = await _post(port, "/task", token="tok123", json={
+            "prompt": "look", "attachments": ["https://cdn/x.png"],
+        })
+        assert status == 200
+        assert calls[2]["attachment_urls"] == ["https://cdn/x.png"]
+        assert calls[0]["attachment_urls"] is None
     finally:
         await srv.stop()
 
@@ -133,6 +140,14 @@ async def test_task_auth_and_validation(monkeypatch):
             {"prompt": "x", "budget": "5"},
             {"prompt": "x", "budget": True},  # bool is an int → 1 ACU
             {"prompt": "x", "budget": -1},
+            {"prompt": "x", "budget": float("nan")},
+            {"prompt": "x", "budget": float("inf")},
+            {"prompt": "x", "budget": 10**400},  # float() overflows
+            # attachments: wrong type / >8 / non-http scheme / oversized
+            {"prompt": "x", "attachments": "https://cdn/x.png"},
+            {"prompt": "x", "attachments": ["https://x"] * 9},
+            {"prompt": "x", "attachments": ["ftp://x", "https://y"]},
+            {"prompt": "x", "attachments": ["https://" + "u" * 2050]},
         ):
             status, _ = await _post(port, "/task", token="tok123", json=bad)
             assert status == 400, bad

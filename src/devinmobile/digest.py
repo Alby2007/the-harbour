@@ -16,7 +16,8 @@ _SUSPENDED = {"suspended"}  # parked — not running, not a failure
 
 
 def _row(binding: Binding) -> str:
-    title = binding.title or binding.session_id[:12]
+    # bound each piece — one long title shouldn't eat the field's 1024
+    title = (binding.title or binding.session_id[:12])[:80]
     desc = f" — {binding.summary[:120]}" if binding.summary else ""
     acu = f" · {binding.acus:g} ACU" if binding.acus else ""
     return f"{title}{desc} · <#{binding.thread_id}>{acu}"

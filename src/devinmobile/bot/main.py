@@ -14,6 +14,7 @@ from ..github_client import GithubClient, PullRef, parse_issue_ref
 from ..links import enrich as enrich_links
 from ..relay import Relay
 from ..scheduler import Scheduler
+from ..spawn import SpawnError, spawn_session
 from ..views import CompletionView, MergeConfirmView, dispatch
 from ..webhook_server import WebhookServer, maybe_start
 from .commands import register_commands
@@ -124,6 +125,11 @@ class DevinMobileBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or (not message.content and not message.attachments):
             return
+        # a DM (or group DM — no guild) is the phone-first intake surface;
+        # unbound guild channels/threads stay inert
+        if message.guild is None:
+            await self._dm_intake(message)
+            return
         binding = await self.db.get_binding_by_thread(message.channel.id)
         if binding is None:
             return
@@ -131,28 +137,39 @@ class DevinMobileBot(discord.Client):
             return
         content = message.content
         attachments = [a.url for a in message.attachments] or None
-        if not content and message.attachments and self.settings.openai_api_key:
-            # Voice notes land as audio/* attachments — transcribe and steer.
+        voice = next(
+            (a for a in message.attachments
+             if (a.content_type or "").startswith("audio/")
+             or getattr(a, "waveform", None)),
+            None,
+        )
+        # Voice notes land as audio/* attachments — transcribe and steer.
+        # A captioned voice note merges transcript + caption rather than
+        # shipping Devin an audio URL it can't use.
+        if voice is not None and self.settings.openai_api_key:
             from ..transcribe import transcribe  # local import: httpx lazily
 
-            voice = next(
-                (a for a in message.attachments
-                 if (a.content_type or "").startswith("audio/")
-                 or getattr(a, "waveform", None)),
-                None,
-            )
-            if voice is not None:
-                try:
-                    content = await transcribe(voice.url, self.settings.openai_api_key)
-                    attachments = [
-                        a.url for a in message.attachments if a is not voice
-                    ] or None
-                    if content:
-                        await message.reply(f"🎤 _{content}_", mention_author=False)
-                except Exception:
-                    log.exception("voice transcription failed")
-                    await message.add_reaction("🎤")
-                    return
+            try:
+                transcript = await transcribe(
+                    voice.url, self.settings.openai_api_key
+                )
+                attachments = [
+                    a.url for a in message.attachments if a is not voice
+                ] or None
+                if transcript:
+                    content = f"{transcript}\n\n{content}".strip()
+                    await message.reply(
+                        f"🎤 _{transcript}_", mention_author=False
+                    )
+            except Exception:
+                log.exception("voice transcription failed")
+                await message.add_reaction("🎤")
+                return
+        elif voice is not None:
+            # no transcription key — don't ship Devin an inert audio URL
+            attachments = [
+                a.url for a in message.attachments if a is not voice
+            ] or None
         if message.reference and message.reference.message_id:
             # Reply-quoting: "yes" / "that one" means nothing to the session
             # without what it refers to — the referenced text rides along.
@@ -197,6 +214,111 @@ class DevinMobileBot(discord.Client):
         except Exception:
             log.exception("forward failed for %s", binding.session_id)
             await message.add_reaction("\u274C")
+
+    # ---- DM intake ----------------------------------------------------------
+    # Phone-first entry: DM an attachment (screenshot, photo, file) or a
+    # `devin:`-prefixed text and a session spawns into the hub channel.
+    # Stray chatter stays inert — no prefix + no attachment → one-line hint.
+
+    _DM_HINT = "DM me `devin: <task>` or attach a file to start a session."
+
+    async def _dm_intake(self, message: discord.Message) -> None:
+        if message.author.id not in self.settings.allowed_user_id_set:
+            return  # silence — a stranger's DM dies quietly
+        content = (message.content or "").strip()
+        attachments = list(message.attachments)
+        # prefix strips before voice merges — "devin: x" in a caption stays
+        # a prefix even when a transcript lands in front of it
+        prefixed = content.lower().startswith("devin:")
+        if prefixed:
+            content = content[6:].strip()
+        voice = next(
+            (a for a in attachments
+             if (a.content_type or "").startswith("audio/")
+             or getattr(a, "waveform", None)),
+            None,
+        )
+        from_voice = False
+        if voice is not None:
+            if not self.settings.openai_api_key:
+                if not content:
+                    await message.reply(
+                        "Voice notes need OPENAI_API_KEY on the bot host.",
+                        mention_author=False,
+                    )
+                    return
+                # caption+voice without a key: drop the inert audio URL
+                # rather than attach a file Devin can't use — and say so
+                attachments = [a for a in attachments if a is not voice]
+                await message.reply(
+                    "No OPENAI_API_KEY — skipping the voice note.",
+                    mention_author=False,
+                )
+            else:
+                from ..transcribe import transcribe  # local: httpx lazily
+
+                try:
+                    transcript = await transcribe(
+                        voice.url, self.settings.openai_api_key
+                    )
+                except Exception:
+                    log.exception("dm voice transcription failed")
+                    await message.add_reaction("🎤")
+                    return
+                attachments = [a for a in attachments if a is not voice]
+                from_voice = True
+                if transcript:
+                    # voice IS the task; a caption adds context. A dictated
+                    # transcript starting "devin:" gets prefix-stripped just
+                    # like typed text — natural.
+                    content = f"{transcript}\n\n{content}".strip()
+                    await message.reply(
+                        f"🎤 _{transcript}_", mention_author=False
+                    )
+        if not (prefixed or attachments or from_voice):
+            await message.reply(self._DM_HINT, mention_author=False)
+            return
+        if content:
+            prompt = content
+        elif attachments:
+            prompt = (
+                "The user sent attached file(s) with no instructions — "
+                "analyze them and report what you find / what you'd need "
+                "next."
+            )
+        else:
+            # "devin:" with nothing after it — a hint, not a spawn
+            await message.reply(self._DM_HINT, mention_author=False)
+            return
+        if "http://" in prompt or "https://" in prompt:
+            try:
+                prompt, _ = await enrich_links(prompt, self.github)
+            except Exception:
+                log.exception("dm link enrichment failed")
+        try:
+            _, thread = await spawn_session(
+                self,
+                prompt=prompt,
+                attachment_urls=[a.url for a in attachments] or None,
+            )
+        except SpawnError as e:
+            await message.reply(str(e), mention_author=False)
+            return
+        except Exception:
+            # create_thread HTTPException et al aren't SpawnError — the
+            # phone user still needs a failure signal, not silence
+            log.exception("dm spawn crashed")
+            await message.reply(
+                "Spawn failed — check the bot log.", mention_author=False
+            )
+            return
+        await message.reply(
+            f"Session started → {thread.jump_url}", mention_author=False
+        )
+        try:
+            await thread.send("Spawned via DM.")
+        except Exception:
+            log.warning("dm provenance note failed for %s", thread.id)
 
     async def _reply_quote(self, message: discord.Message) -> str | None:
         """Resolve a reply's referenced message to a ≤300-char quote."""

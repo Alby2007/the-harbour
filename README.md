@@ -57,6 +57,11 @@ approval → anything you type in the thread steers the session.
 - **Digest** — `/digest` and `/schedule kind:digest` roll up what Devin
   did in a window (grouped by outcome, per-session summary + ACU) from
   summaries persisted at completion — a local read, no API calls
+- **Attachments everywhere** — `/devin`/`/continue`/`/chain` take a native
+  `attachment:` file picker; `/task` accepts `attachments` URLs; and a DM
+  photo (or voice note, Whisper-transcribed) with a caption spawns a
+  session straight from your phone's share sheet — `devin: <task>` works
+  in DM too
 - **Resilience** — an errored session auto-respawns once as a seeded
   continuation (summary + files + error), and `/continue` chains a
   finished session's work into a fresh one

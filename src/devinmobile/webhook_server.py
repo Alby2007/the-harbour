@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import discord
@@ -97,12 +98,40 @@ class WebhookServer:
         if title is not None and not isinstance(title, str):
             return web.Response(status=400)
         budget = payload.get("budget")
-        # bool is an int subclass — True would cap the task at 1 ACU
-        if budget is not None and (
-            isinstance(budget, bool)
-            or not isinstance(budget, (int, float))
-            or budget <= 0
+        # bool is an int subclass — True would cap the task at 1 ACU.
+        # json.loads accepts NaN/Infinity literals, and float() of a
+        # huge int overflows — all of those are a 400, not a spawn.
+        if budget is not None:
+            try:
+                if isinstance(budget, bool) or not isinstance(
+                    budget, (int, float)
+                ):
+                    raise ValueError
+                budget_f = float(budget)
+                if not (math.isfinite(budget_f) and budget_f > 0):
+                    raise ValueError
+            except (ValueError, OverflowError):
+                return web.Response(status=400)
+        else:
+            budget_f = None
+        # caller-supplied URLs — Devin must be able to fetch them publicly
+        # (no Discord-CDN guarantee for external clients), hence the
+        # http(s) scheme gate.
+        raw_atts = payload.get("attachments")
+        if raw_atts is None:
+            attachment_urls = None
+        elif (
+            isinstance(raw_atts, list)
+            and len(raw_atts) <= 8
+            and all(
+                isinstance(u, str)
+                and len(u) <= 2048
+                and u.startswith(("http://", "https://"))
+                for u in raw_atts
+            )
         ):
+            attachment_urls = raw_atts or None  # [] == absent
+        else:
             return web.Response(status=400)
         from .spawn import SpawnError, spawn_session  # local: import cycle
 
@@ -112,7 +141,8 @@ class WebhookServer:
                 prompt=prompt,
                 repos=repos or None,
                 title=title,
-                budget=float(budget) if budget is not None else None,
+                budget=budget_f,
+                attachment_urls=attachment_urls,
             )
         except SpawnError as e:
             return web.json_response({"error": str(e)}, status=502)
