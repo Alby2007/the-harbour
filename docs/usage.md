@@ -263,6 +263,38 @@ breakdown (`spawned_by` — Discord pings for snowflakes, marker names like
 
 Refreshes a session's status embed on demand (defaults to the most recent).
 
+### `/secrets` / `/unsecret <key>`
+
+Org-secret admin. `/secrets` lists **metadata only** — key, type, note,
+access scope. The API is write-only: no value field exists anywhere, so
+nothing here can leak one. `/unsecret` deletes by key — irreversible;
+gated to `TEAM_ADMIN_IDS` when configured (flat trust when unset).
+
+⚠ **Org secrets auto-inject into every session's environment** — creating
+one via `POST /secret` makes it ambient org-wide, no per-session grant
+step. For session-scoped injection use `/task`'s `secrets` field instead.
+
+### `/playbooks` / `/playbook-run` / `/playbook-save` / `/playbook-delete`
+
+Native Devin playbooks — **stored instruction-bodies** (saved personas /
+runbooks), not orchestration. The playbook `body` lands on the session as
+standing instructions; the overlay `prompt:` is the task for this run.
+
+- `/playbooks` — ephemeral list (title, excerpt, id).
+- `/playbook-run <name> [prompt] [repo] [model]` — resolves the title
+  (case-insensitive exact, then substring — ambiguous names get a list
+  back) and spawns with `playbook_id`. Binds a thread normally — the
+  whole relay/attribution/ACU pipeline applies. `model:` can't combine —
+  model selection rides the ACP bridge, which can't carry playbooks.
+- `/playbook-save <name>` — the body comes up as a dialog (paragraph
+  input — playbook bodies are long-form). Creates new, or full-replaces
+  an existing playbook on an exact-title match.
+- `/playbook-delete <name>` — admin-gated like `/unsecret`.
+
+These are the API's playbooks (`/v3/.../playbooks`) — distinct from
+`/chain`'s built-in multi-phase playbooks, which orchestrate
+sequential sessions with gates.
+
 ## HTTP task intake
 
 `POST /task` on the webhook port lets anything that can curl spawn a
@@ -283,7 +315,10 @@ curl -X POST https://<host>/task \
 Body: `prompt` (required, ≤4000 chars), `repo` (string or array,
 comma-separate works), `title`, `budget` (ACU cap), `attachments` (array
 of ≤8 `http(s)://` URLs, each ≤2048 chars — they must be publicly
-fetchable by Devin), `by` (optional caller name ≤64 chars — becomes the
+fetchable by Devin), `secrets` (`{KEY: VALUE}` map ≤16 entries —
+per-session env injection via `session_secrets`, session-scoped not
+org-wide; intake-only since values transit HTTPS→bot→Devin, never
+Discord), `by` (optional caller name ≤64 chars — becomes the
 session's `spawned_by`, so a Discord snowflake pings that user — numeric
 values must be an allowlisted id, else `400`).
 Success → `200` with `session_id`, `thread_id`, `session_url`, and
@@ -295,6 +330,14 @@ Per-client tokens: `TASK_INTAKE_TOKENS=abc:alby,def:sam` gives each caller
 its own bearer — requests authed by a mapped token attribute the session
 to the mapped name and **ignore** `by:` (the mapping is the stronger
 claim). Either mechanism alone enables the route; both can coexist.
+
+`POST /secret` shares the same bearer auth — body `{key, value,
+type?, note?}` creates an org secret (`type`: `key-value`|`cookie`|
+`totp`, default `key-value`); `409` if the key already exists (delete
+first). `DELETE /secret/{key}` removes one. Values go HTTPS→bot→Devin and
+are never echoed back — this is the only secret-create surface precisely
+because nothing valuable ever touches Discord. Remember: org secrets
+auto-inject into **every** session's env.
 
 ## DM intake
 

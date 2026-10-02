@@ -70,33 +70,38 @@ class WebhookServer:
             routes.append("/github")
         if self.task_token or self.task_token_map:
             app.router.add_post("/task", self._handle_task)
-            routes.append("/task")
+            app.router.add_post("/secret", self._handle_secret)
+            app.router.add_delete("/secret/{key}", self._handle_secret_delete)
+            routes += ["/task", "/secret"]
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "0.0.0.0", self.port)
         await site.start()
         log.info("webhook/intake receiver on :%d%s", self.port, routes)
 
+    def _task_auth(self, request: web.Request) -> str | None:
+        """Bearer check shared by /task and /secret — returns the mapped
+        caller name, "" for the unmapped single token, None on failure.
+        Bytes compare_digest — a non-ASCII bearer would TypeError on str."""
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        for t, name in self.task_token_map.items():
+            if hmac.compare_digest(token.encode(), t.encode()):
+                return name
+        if self.task_token and hmac.compare_digest(
+            token.encode(), self.task_token.encode()
+        ):
+            return ""
+        return None
+
     async def _handle_task(self, request: web.Request) -> web.Response:
         """POST /task — bearer-authed intake so anything that can curl
         (Siri Shortcuts, Raycast, another bot) can spawn a session.
         Discord becomes the renderer, not the only source."""
-        auth = request.headers.get("Authorization", "")
-        token = auth[7:] if auth.startswith("Bearer ") else ""
-        # bytes compare_digest — a non-ASCII bearer would TypeError on str
-        mapped = next(
-            (
-                name
-                for t, name in self.task_token_map.items()
-                if hmac.compare_digest(token.encode(), t.encode())
-            ),
-            None,
-        )
-        if mapped is None and not (
-            self.task_token
-            and hmac.compare_digest(token.encode(), self.task_token.encode())
-        ):
+        caller = self._task_auth(request)
+        if caller is None:
             return web.Response(status=401)
+        mapped = caller or None
         try:
             payload = await request.json()
         except ValueError:
@@ -158,6 +163,30 @@ class WebhookServer:
             attachment_urls = raw_atts or None  # [] == absent
         else:
             return web.Response(status=400)
+        # `secrets` {K: V} → session_secrets — per-session env injection
+        # that stays session-scoped (unlike org secrets, which auto-inject
+        # everywhere). Intake-only: values transit HTTPS→bot→Devin, never
+        # Discord message content, so /devin deliberately has no secrets
+        # option.
+        raw_secrets = payload.get("secrets")
+        if raw_secrets is None:
+            session_secrets = None
+        elif (
+            isinstance(raw_secrets, dict)
+            and len(raw_secrets) <= 16
+            and all(
+                isinstance(k, str)
+                and isinstance(v, str)
+                and 0 < len(k) <= 128
+                and len(v) <= 8192
+                for k, v in raw_secrets.items()
+            )
+        ):
+            session_secrets = [
+                {"key": k, "value": v} for k, v in raw_secrets.items()
+            ] or None  # {} == absent
+        else:
+            return web.Response(status=400)
         # spawned_by precedence: token-map name → `by:` field → "intake".
         # A mapped token IGNORES by: — the mapping is the stronger claim,
         # so the field isn't even validated under it.
@@ -192,6 +221,7 @@ class WebhookServer:
                 budget=budget_f,
                 attachment_urls=attachment_urls,
                 spawned_by=spawned_by,
+                session_secrets=session_secrets,
             )
         except SpawnError as e:
             return web.json_response({"error": str(e)}, status=502)
@@ -214,6 +244,82 @@ class WebhookServer:
                 f"https://discord.com/channels/{guild_id or '@me'}/{thread.id}"
             ),
         })
+
+    async def _handle_secret(self, request: web.Request) -> web.Response:
+        """POST /secret — org-secret create under the intake token. The
+        value goes HTTPS→bot→Devin and is never echoed (the API is
+        write-only — no read-back exists, so 'never Discord' is enforced
+        by the surface). Org secrets auto-inject into every session's
+        env — the blast radius is all sessions."""
+        if self._task_auth(request) is None:
+            return web.Response(status=401)
+        try:
+            payload = await request.json()
+        except ValueError:
+            return web.Response(status=400)
+        if not isinstance(payload, dict):
+            return web.Response(status=400)
+        key = payload.get("key")
+        value = payload.get("value")
+        if (
+            not isinstance(key, str)
+            or not key.strip()
+            or len(key) > 128
+            or not isinstance(value, str)
+            or not value
+            or len(value) > 8192
+        ):
+            return web.Response(status=400)
+        key = key.strip()
+        stype = payload.get("type") or "key-value"
+        if stype not in ("key-value", "cookie", "totp"):
+            return web.json_response(
+                {"error": "type must be key-value|cookie|totp"}, status=400
+            )
+        note = payload.get("note")
+        if note is not None and (
+            not isinstance(note, str) or len(note) > 200
+        ):
+            return web.Response(status=400)
+        try:
+            existing = await self.bot.devin.list_secrets()
+        except Exception:
+            log.exception("secret list failed")
+            return web.json_response({"error": "Devin API failed"}, status=502)
+        if any(s.get("key") == key for s in existing):
+            return web.json_response(
+                {"error": f"secret {key!r} already exists — delete it first"},
+                status=409,
+            )
+        try:
+            await self.bot.devin.create_secret(
+                key, value, type=stype, note=note
+            )
+        except Exception as e:
+            log.exception("secret create failed for %r", key)
+            return web.json_response({"error": str(e)}, status=502)
+        return web.json_response({
+            "key": key,
+            "type": stype,
+            "scope": "org — auto-injects into every session's env",
+        })
+
+    async def _handle_secret_delete(self, request: web.Request) -> web.Response:
+        """DELETE /secret/{key} — same token auth; anyone holding the
+        intake token is admin-equivalent for secrets."""
+        if self._task_auth(request) is None:
+            return web.Response(status=401)
+        key = request.match_info["key"]
+        try:
+            deleted = await self.bot.devin.delete_secret_by_key(key)
+        except Exception:
+            log.exception("secret delete failed for %r", key)
+            return web.json_response({"error": "Devin API failed"}, status=502)
+        if not deleted:
+            return web.json_response(
+                {"error": f"no secret {key!r}"}, status=404
+            )
+        return web.json_response({"key": key, "deleted": True})
 
     async def stop(self) -> None:
         if self._runner:

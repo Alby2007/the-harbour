@@ -42,6 +42,19 @@ DEFAULT_STRUCTURED_OUTPUT_SCHEMA: dict[str, Any] = {
 SESSION_TAG = "discord-mobile"
 
 
+def _items(data: Any, *keys: str) -> list[dict[str, Any]]:
+    """v3 list endpoints wrap rows inconsistently — accept a bare list or
+    any of the usual envelope keys."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("items", *keys):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
+    return []
+
+
 class DevinClient:
     def __init__(
         self,
@@ -98,6 +111,8 @@ class DevinClient:
         structured_output_schema: dict[str, Any] | None = DEFAULT_STRUCTURED_OUTPUT_SCHEMA,
         attachment_urls: list[str] | None = None,
         bypass_approval: bool | None = None,
+        session_secrets: list[dict[str, str]] | None = None,
+        playbook_id: str | None = None,
     ) -> Session:
         body: dict[str, Any] = {"prompt": prompt}
         if repos:
@@ -118,6 +133,14 @@ class DevinClient:
             body["attachment_urls"] = attachment_urls
         if bypass_approval is not None:
             body["bypass_approval"] = bypass_approval
+        if session_secrets:
+            # verified field (422 on wrong shape): literal per-session env
+            # injection for secrets that must NOT be org-wide
+            body["session_secrets"] = session_secrets
+        if playbook_id:
+            # verified end-to-end: the playbook body lands as standing
+            # instructions on the session
+            body["playbook_id"] = playbook_id
         resp = await self._request("POST", self._path("/sessions"), json=body)
         return Session.model_validate(resp.json())
 
@@ -161,3 +184,66 @@ class DevinClient:
             "GET", self._path(f"/sessions/{session_id}/messages"), params=params
         )
         return MessagePage.model_validate(resp.json())
+
+    # ---- org secrets (write-only — no value read-back exists on the API) --
+
+    async def list_secrets(self) -> list[dict[str, Any]]:
+        """GET /secrets — metadata rows only (secret_id, key, note, types).
+        The API serves no value field anywhere."""
+        resp = await self._request("GET", self._path("/secrets"))
+        return _items(resp.json(), "secrets")
+
+    async def create_secret(
+        self,
+        key: str,
+        value: str,
+        *,
+        type: str = "key-value",
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /secrets. An access_type:'org' secret auto-injects into
+        EVERY session's env — no per-session grant step (probe finding)."""
+        body: dict[str, Any] = {"key": key, "value": value, "type": type}
+        if note:
+            body["note"] = note
+        resp = await self._request("POST", self._path("/secrets"), json=body)
+        return resp.json()
+
+    async def delete_secret_by_key(self, key: str) -> bool:
+        """No key-addressed DELETE exists — resolve key → secret_id via the
+        list first. False when the key isn't there."""
+        for s in await self.list_secrets():
+            if s.get("key") == key and s.get("secret_id"):
+                await self._request(
+                    "DELETE", self._path(f"/secrets/{s['secret_id']}")
+                )
+                return True
+        return False
+
+    # ---- playbooks (stored instruction-bodies, not orchestration) --------
+
+    async def list_playbooks(self) -> list[dict[str, Any]]:
+        resp = await self._request("GET", self._path("/playbooks"))
+        return _items(resp.json(), "playbooks")
+
+    async def create_playbook(
+        self, title: str, body: str
+    ) -> dict[str, Any]:
+        resp = await self._request(
+            "POST", self._path("/playbooks"),
+            json={"title": title, "body": body},
+        )
+        return resp.json()
+
+    async def update_playbook(
+        self, playbook_id: str, *, title: str, body: str
+    ) -> dict[str, Any]:
+        """Full replace — PATCH is 405 on this surface (probe)."""
+        resp = await self._request(
+            "PUT", self._path(f"/playbooks/{playbook_id}"),
+            json={"title": title, "body": body},
+        )
+        return resp.json()
+
+    async def delete_playbook(self, playbook_id: str) -> None:
+        await self._request("DELETE", self._path(f"/playbooks/{playbook_id}"))

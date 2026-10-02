@@ -22,6 +22,47 @@ Desktop) — the ACP details are empirical and could shift between releases.
 Devin messages can embed `ATTACHMENT:{json}` markers inline — the relay strips
 them and relays `url` as a link.
 
+### Secrets — `/organizations/{org}/secrets`
+
+Probed live (session `energetic-stay`, artifacts cleaned up). Secrets are
+**write-only**: no value field exists on any response — `GET /secrets/{id}`
+is 405, so read-back is structurally impossible.
+
+| Call | Status |
+| --- | --- |
+| `GET /secrets` | 200 — metadata only: `secret_id`, `key`, `note`, `is_sensitive`, `secret_type`, `access_type`, created/updated by/at |
+| `POST /secrets` | 200 — body `{type: "cookie"\|"key-value"\|"totp", key, value, note?}` |
+| `GET /secrets/{id}` | 405 — no individual read |
+| `DELETE /secrets/{id}` | 200 — resource validated first (403 on a nonexistent id was auth-check ordering; real ids delete fine) |
+
+**Auto-inject**: an `access_type: "org"` secret lands in **every** session's
+environment — the probe session saw the key set with no grant step. Create
+once → ambient everywhere; that IS the blast radius.
+
+`session_secrets` on `POST /sessions` is a validated field (422 on wrong
+shape): `[{key, value}]` — literal per-session env injection for secrets
+that must NOT be org-wide.
+
+Dead ends: ACP `secretSend`/`secret/create` → -32601; `POST
+/sessions/{id}/secrets` → 404 (no mid-session grant). The CLI's
+`devin cloud drs secret-create` remains the most-secure local path.
+
+### Playbooks — `/organizations/{org}/playbooks`
+
+A playbook = a **stored instruction-body** (`title`, `body`, plus
+unexplored `macro`/`structured_output_schema` fields) injectable via
+`playbook_id` on session create. Not orchestration: no cross-session
+state, no gates, no threads — `/chain` stays the multi-phase tool;
+playbooks are saved personas/runbooks a chain phase could reference.
+
+| Call | Status |
+| --- | --- |
+| `GET /playbooks` | 200 — full items incl. `body`, `macro`, `structured_output_schema` |
+| `POST /playbooks` | 200 — `{title, body}` required |
+| `PUT /playbooks/{id}` | 200 — full replace (PATCH is 405) |
+| `DELETE /playbooks/{id}` | 200 |
+| `POST /sessions {playbook_id}` | verified end-to-end — echoed in response; body injected as standing instructions; session saw the playbook by title and obeyed it |
+
 ## ACP bridge — `wss://{devin_api_url}/acp/live?token={windsurf_api_key}`
 
 JSON-RPC 2.0, one message per WS text frame. This is what the Devin CLI

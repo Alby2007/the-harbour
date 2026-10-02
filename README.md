@@ -89,6 +89,11 @@ approval → anything you type in the thread steers the session.
 - **Session admin** — `/kill` reports what the v3 `DELETE` actually did,
   `/delete` hides a session from lists (ACU still counts; `wipe:` clears
   the thread), `/rename` retitles the thread + binding
+- **Secrets + playbooks** — `POST /secret` intake creates org secrets
+  (values go HTTPS→bot→Devin, never Discord; org secrets auto-inject into
+  every session's env), `/task secrets:` injects session-scoped env vars,
+  `/playbook-save` `/playbook-run` `/playbooks` `/playbook-delete` manage
+  Devin's stored runbooks
 - **Presence** — the bot's Discord status shows `N Devin sessions running`
 - **Diff-on-phone** — completion cards attach the PR's `.diff` file so the
   actual change is readable without opening GitHub

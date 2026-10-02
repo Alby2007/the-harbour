@@ -103,6 +103,68 @@ def _split_repos(repo: str | None) -> list[str] | None:
     return [r.strip() for r in repo.split(",") if r.strip()] if repo else None
 
 
+def resolve_playbook(
+    name: str, books: list[dict]
+) -> dict | list[dict] | None:
+    """title → playbook row: exact case-insensitive first, then substring
+    (repo-canonicalization style). Returns the book, a list when the
+    substring is ambiguous, or None."""
+    low = name.strip().lower()
+    for b in books:
+        if str(b.get("title") or "").lower() == low:
+            return b
+    hits = [
+        b for b in books if low and low in str(b.get("title") or "").lower()
+    ]
+    if len(hits) == 1:
+        return hits[0]
+    return hits or None
+
+
+def _playbook_id(book: dict) -> str:
+    return str(book.get("playbook_id") or book.get("id") or "")
+
+
+class _PlaybookBodyModal(discord.ui.Modal):
+    """Playbook bodies are long-form prose — a slash-option string caps
+    poorly, so /playbook-save collects it through a paragraph input."""
+
+    body: discord.ui.TextInput = discord.ui.TextInput(
+        label="Playbook body (standing instructions)",
+        style=discord.TextStyle.paragraph,
+        max_length=8000,
+        required=True,
+    )
+
+    def __init__(self, name: str, on_submit) -> None:
+        super().__init__(title=f"Playbook: {name[:45]}")
+        self._cb = on_submit
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self._cb(interaction, str(self.body.value))
+
+
+async def playbook_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    devin = getattr(interaction.client, "devin", None)
+    if devin is None:
+        return []
+    try:
+        books = await devin.list_playbooks()
+    except Exception:  # noqa: BLE001 — autocomplete must never fail the command
+        return []
+    cur = current.lower()
+    return [
+        app_commands.Choice(
+            name=str(b.get("title") or "")[:100],
+            value=str(b.get("title") or "")[:100],
+        )
+        for b in books
+        if not cur or cur in str(b.get("title") or "").lower()
+    ][:25]
+
+
 def user_role_ids(user) -> list[int]:
     """Snowflakes from `Member.roles`; a DM `User` (and `None`) carries
     none — DM access is always allowlist/db-only, no role shortcut."""
@@ -130,6 +192,16 @@ def _may_destroy(settings, actor_id: int, owner: str) -> bool:
 
 
 _OWNER_OR_ADMIN = "That belongs to someone else — owner or admin only."
+
+
+def _admin_ok(settings, user_id: int) -> bool:
+    """Org-wide destructive ops on unowned objects (secrets, playbooks —
+    there's no per-object owner). TEAM_ADMIN_IDS set → admins only;
+    unset → flat trust (solo default, the operator gate already ran)."""
+    return (
+        not settings.admin_user_id_set
+        or settings.is_admin(user_id)
+    )
 
 
 def usage_summary(bindings: list[Binding], now: float) -> dict:
@@ -1212,3 +1284,305 @@ def register_commands(bot: "DevinMobileBot") -> None:
         ):
             msg += " (Still allowed via the guild role.)"
         await interaction.response.send_message(msg, ephemeral=True)
+
+    # ---- Org secrets + native playbooks (v3 surfaces, probe-verified) ----
+    # Org secrets are write-only: the API serves no value field anywhere,
+    # so /secrets can list metadata but nothing here can leak a value.
+    # Org-scope secrets auto-inject into EVERY session's env — that's the
+    # point (create once → ambient) and the blast radius.
+
+    @tree.command(
+        name="secrets",
+        description="List org secrets — metadata only; values are "
+        "write-only on the API",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def secrets_cmd(interaction: discord.Interaction) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        try:
+            rows = await bot.devin.list_secrets()
+        except Exception as e:  # noqa: BLE001 — surface the API message
+            await interaction.response.send_message(
+                f"Secret list failed: `{e}`", ephemeral=True
+            )
+            return
+        if not rows:
+            await interaction.response.send_message(
+                "No org secrets. Create one via `POST /secret` on the "
+                "intake endpoint (values never transit Discord).",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(
+            title="Org secrets",
+            description=(
+                "Org secrets **auto-inject into every session's env** — "
+                "creating one here is org-wide by definition."
+            ),
+        )
+        for s in rows[:20]:
+            bits = [f"`{s.get('secret_type') or s.get('type') or 'key-value'}`"]
+            if s.get("note"):
+                bits.append(str(s["note"])[:120])
+            bits.append(f"access: `{s.get('access_type') or '?'}`")
+            embed.add_field(
+                name=str(s.get("key") or "?")[:100],
+                value=" · ".join(bits),
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(
+        name="unsecret",
+        description="Delete an org secret by key — irreversible, admin "
+        "only when TEAM_ADMIN_IDS is set",
+    )
+    @app_commands.describe(name="The secret's key, from /secrets")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def unsecret_cmd(interaction: discord.Interaction, name: str) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if not _admin_ok(bot.settings, interaction.user.id):
+            await interaction.response.send_message(
+                "Admins only.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            deleted = await bot.devin.delete_secret_by_key(name.strip())
+        except Exception as e:  # noqa: BLE001
+            await interaction.followup.send(
+                f"Secret delete failed: `{e}`", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"Deleted org secret `{name}` — sessions stop seeing it."
+            if deleted
+            else f"No org secret named `{name}`.",
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="playbooks",
+        description="List Devin playbooks — stored instruction-bodies "
+        "run via /playbook-run",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def playbooks_cmd(interaction: discord.Interaction) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        try:
+            books = await bot.devin.list_playbooks()
+        except Exception as e:  # noqa: BLE001
+            await interaction.response.send_message(
+                f"Playbook list failed: `{e}`", ephemeral=True
+            )
+            return
+        if not books:
+            await interaction.response.send_message(
+                "No playbooks yet — `/playbook-save` stores one.",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(
+            title="Devin playbooks",
+            description=(
+                "Saved runbooks — the body lands as standing instructions "
+                "on the session. Not orchestration (that's `/chain`)."
+            ),
+        )
+        for b in books[:20]:
+            embed.add_field(
+                name=str(b.get("title") or "?")[:100],
+                value=(
+                    str(b.get("body") or "").replace("\n", " ")[:150]
+                    + f"\n`{_playbook_id(b)}`"
+                ),
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(
+        name="playbook-run",
+        description="Spawn a session carrying a playbook's instructions",
+    )
+    @app_commands.describe(
+        name="Playbook title (exact or substring)",
+        prompt="Overlay prompt — the task for this run (default: follow "
+        "the playbook)",
+        repo="org/repo (comma-separate for several)",
+        model="Model picker — CANNOT combine with playbooks (bridge "
+        "sessions can't carry them)",
+    )
+    @app_commands.autocomplete(
+        name=playbook_autocomplete, repo=repo_autocomplete,
+        model=model_autocomplete,
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def playbook_run_cmd(
+        interaction: discord.Interaction,
+        name: str,
+        prompt: str | None = None,
+        repo: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        try:
+            books = await bot.devin.list_playbooks()
+        except Exception as e:  # noqa: BLE001
+            await interaction.response.send_message(
+                f"Playbook list failed: `{e}`", ephemeral=True
+            )
+            return
+        hit = resolve_playbook(name, books)
+        if hit is None:
+            await interaction.response.send_message(
+                f"No playbook matching {name!r} — `/playbooks` lists them.",
+                ephemeral=True,
+            )
+            return
+        if isinstance(hit, list):
+            await interaction.response.send_message(
+                f"{name!r} is ambiguous — "
+                + ", ".join(f"`{b.get('title')}`" for b in hit[:8]),
+                ephemeral=True,
+            )
+            return
+        pid = _playbook_id(hit)
+        if not pid:
+            await interaction.response.send_message(
+                f"Playbook `{hit.get('title')}` has no id — API drift.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        try:
+            _, thread = await spawn_session(
+                bot,
+                prompt=prompt or f"Follow the playbook: {hit.get('title')}",
+                repos=_split_repos(repo),
+                model=model,
+                title=str(hit.get("title") or name)[:90],
+                playbook_id=pid,
+                spawned_by=str(interaction.user.id),
+            )
+        except SpawnError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"Playbook `{hit.get('title')}` running → {thread.mention}"
+        )
+
+    @tree.command(
+        name="playbook-save",
+        description="Create a playbook (or overwrite one with the same "
+        "exact title) — the body comes up as a dialog",
+    )
+    @app_commands.describe(name="Playbook title")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def playbook_save_cmd(
+        interaction: discord.Interaction, name: str
+    ) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        title = name.strip()
+        if not title:
+            await interaction.response.send_message(
+                "Give a non-empty name.", ephemeral=True
+            )
+            return
+
+        async def _save(ix: discord.Interaction, body: str) -> None:
+            try:
+                books = await bot.devin.list_playbooks()
+            except Exception as e:  # noqa: BLE001
+                await ix.response.send_message(
+                    f"Playbook list failed: `{e}`", ephemeral=True
+                )
+                return
+            # replace ONLY on an exact-title match — a substring hit on a
+            # different playbook must not get overwritten
+            existing = next(
+                (
+                    b for b in books
+                    if str(b.get("title") or "").lower() == title.lower()
+                ),
+                None,
+            )
+            try:
+                if existing is not None and _playbook_id(existing):
+                    await bot.devin.update_playbook(
+                        _playbook_id(existing), title=title, body=body
+                    )
+                    verb = "Updated"
+                else:
+                    await bot.devin.create_playbook(title, body)
+                    verb = "Saved"
+            except Exception as e:  # noqa: BLE001
+                await ix.response.send_message(
+                    f"Playbook save failed: `{e}`", ephemeral=True
+                )
+                return
+            await ix.response.send_message(
+                f"{verb} playbook `{title}` — run it with `/playbook-run`.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_modal(_PlaybookBodyModal(title, _save))
+
+    @tree.command(
+        name="playbook-delete",
+        description="Delete a playbook — admin only when TEAM_ADMIN_IDS "
+        "is set",
+    )
+    @app_commands.describe(name="Playbook title (exact or substring)")
+    @app_commands.autocomplete(name=playbook_autocomplete)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def playbook_delete_cmd(
+        interaction: discord.Interaction, name: str
+    ) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        if not _admin_ok(bot.settings, interaction.user.id):
+            await interaction.response.send_message(
+                "Admins only.", ephemeral=True
+            )
+            return
+        try:
+            books = await bot.devin.list_playbooks()
+        except Exception as e:  # noqa: BLE001
+            await interaction.response.send_message(
+                f"Playbook list failed: `{e}`", ephemeral=True
+            )
+            return
+        hit = resolve_playbook(name, books)
+        if hit is None:
+            await interaction.response.send_message(
+                f"No playbook matching {name!r}.", ephemeral=True
+            )
+            return
+        if isinstance(hit, list):
+            await interaction.response.send_message(
+                f"{name!r} is ambiguous — "
+                + ", ".join(f"`{b.get('title')}`" for b in hit[:8]),
+                ephemeral=True,
+            )
+            return
+        try:
+            await bot.devin.delete_playbook(_playbook_id(hit))
+        except Exception as e:  # noqa: BLE001
+            await interaction.response.send_message(
+                f"Playbook delete failed: `{e}`", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"Deleted playbook `{hit.get('title')}`.", ephemeral=True
+        )

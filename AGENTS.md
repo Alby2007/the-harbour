@@ -246,6 +246,20 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
 - `Relay._presence` writes bot status only when the active-binding count
   changes, skips until `is_ready()` (the first tick can precede the ws),
   and clears at zero — all failures are swallowed, it's cosmetic.
+- Org secrets are write-only and ambient: `GET /secrets` serves metadata
+  only (no value field exists anywhere on the API — `GET /secrets/{id}`
+  is 405), and an `access_type:"org"` secret auto-injects into EVERY
+  session's env. Creation is `POST /secret` on the intake port only —
+  values must never transit Discord; `session_secrets` on `POST
+  /sessions` is the session-scoped alternative and is likewise gated to
+  `/task`, not `/devin`. `delete_secret_by_key` resolves key→id via the
+  list (no key-addressed DELETE).
+- Playbooks (`/playbook*`) are stored instruction-bodies on
+  `/v3/.../playbooks` — NOT orchestration; `/chain` is unaffected.
+  `playbook_id`/`session_secrets` are v3-create-only: `spawn_session`
+  rejects them with `model:` (bridge can't carry them) and suppresses an
+  env `default_model` rather than silently drop the field. Playbook
+  update is PUT full-replace — PATCH is 405.
 - Snapshot warm-start: probed (`scripts/probe_snapshots.py`) — `session/new`
   has no blueprint select and there are no update/save methods; blueprints
   auto-apply per repo so there's nothing left to build.

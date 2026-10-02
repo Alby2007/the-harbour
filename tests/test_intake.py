@@ -34,9 +34,37 @@ class _Thread:
         return None
 
 
+class _Devin:
+    """Secret ops for the /secret route tests."""
+
+    def __init__(self):
+        self.secrets: list[dict] = [
+            {"secret_id": "sec-1", "key": "EXISTING",
+             "secret_type": "key-value"},
+        ]
+        self.created: list[dict] = []
+
+    async def list_secrets(self):
+        return list(self.secrets)
+
+    async def create_secret(self, key, value, *, type="key-value", note=None):
+        self.created.append(
+            {"key": key, "value": value, "type": type, "note": note}
+        )
+        return {"secret_id": "sec-new"}
+
+    async def delete_secret_by_key(self, key):
+        for s in self.secrets:
+            if s["key"] == key:
+                self.secrets.remove(s)
+                return True
+        return False
+
+
 class _Bot:
     def __init__(self, settings):
         self.settings = settings
+        self.devin = _Devin()
 
 
 async def _server(monkeypatch, settings=None, spawned=None):
@@ -235,6 +263,135 @@ async def test_task_by_snowflake_needs_allowlist(monkeypatch):
         assert status == 400
         assert "allowlisted" in body.get("error", "")
         assert len(calls) == 1  # nothing spawned
+    finally:
+        await srv.stop()
+
+
+async def test_task_secrets_passthrough(monkeypatch):
+    """`secrets: {K: V}` becomes session_secrets [{key,value}] — literal
+    per-session env injection, session-scoped (unlike org secrets)."""
+    srv, calls = await _server(monkeypatch)
+    try:
+        port = _port(srv)
+        status, _ = await _post(port, "/task", token="tok123", json={
+            "prompt": "deploy it",
+            "secrets": {"GH_PAT": "s3cr3t", "NPM": "tok"},
+        })
+        assert status == 200
+        assert calls[0]["session_secrets"] == [
+            {"key": "GH_PAT", "value": "s3cr3t"},
+            {"key": "NPM", "value": "tok"},
+        ]
+        # absent and {} both mean "no secrets field"
+        status, _ = await _post(port, "/task", token="tok123",
+                                json={"prompt": "x"})
+        assert status == 200
+        assert calls[1]["session_secrets"] is None
+        status, _ = await _post(port, "/task", token="tok123",
+                                json={"prompt": "x", "secrets": {}})
+        assert status == 200
+        assert calls[2]["session_secrets"] is None
+        # wrong shapes → 400, not a silently-dropped injection
+        for bad in (
+            "GH_PAT=x",                      # not a dict
+            [{"key": "K", "value": "v"}],    # list form
+            {"K": 7},                        # non-str value
+            {"": "v"},                       # empty key
+            {"K" * 129: "v"},                # oversized key
+            {f"K{i}": "v" for i in range(17)},  # >16 entries
+        ):
+            status, _ = await _post(port, "/task", token="tok123",
+                                    json={"prompt": "x", "secrets": bad})
+            assert status == 400, bad
+    finally:
+        await srv.stop()
+
+
+# ---- POST/DELETE /secret — org-secret intake -----------------------------
+
+
+async def _del(port, path, token=None):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with aiohttp.ClientSession() as cs:
+        async with cs.delete(
+            f"http://127.0.0.1:{port}{path}", headers=headers
+        ) as resp:
+            body = (
+                await resp.json()
+                if "application/json" in resp.headers.get("Content-Type", "")
+                else {}
+            )
+            return resp.status, body
+
+
+async def test_secret_intake_happy_and_dup(monkeypatch):
+    srv, _ = await _server(monkeypatch)
+    try:
+        port = _port(srv)
+        status, body = await _post(port, "/secret", token="tok123", json={
+            "key": "NPM_TOKEN", "value": "npm_xyz", "type": "key-value",
+            "note": "publish",
+        })
+        assert status == 200
+        assert body["key"] == "NPM_TOKEN"
+        assert "value" not in body  # never echoed
+        assert "auto-inject" in body["scope"]
+        created = srv.bot.devin.created[0]
+        assert created["key"] == "NPM_TOKEN"
+        assert created["value"] == "npm_xyz"
+        # duplicate key → 409 (list-first guard), not a silent overwrite
+        status, body = await _post(port, "/secret", token="tok123", json={
+            "key": "EXISTING", "value": "v",
+        })
+        assert status == 409
+        # a mapped intake token authenticates too
+        status, _ = await _post(port, "/secret", token="mapA", json={
+            "key": "K2", "value": "v",
+        })
+        assert status == 200
+    finally:
+        await srv.stop()
+
+
+async def test_secret_intake_auth_and_validation(monkeypatch):
+    srv, _ = await _server(monkeypatch)
+    try:
+        port = _port(srv)
+        status, _ = await _post(port, "/secret",
+                                json={"key": "K", "value": "v"})
+        assert status == 401
+        status, _ = await _post(port, "/secret", token="wrong",
+                                json={"key": "K", "value": "v"})
+        assert status == 401
+        for bad in (
+            {"value": "v"},                    # no key
+            {"key": "K"},                      # no value
+            {"key": "", "value": "v"},
+            {"key": "K", "value": ""},
+            {"key": "K", "value": "v", "type": "bogus"},
+            {"key": "K", "value": "v", "note": 7},
+            "not a dict",
+        ):
+            status, _ = await _post(port, "/secret", token="tok123",
+                                    json=bad)
+            assert status == 400, bad
+        assert srv.bot.devin.created == []  # nothing was created
+    finally:
+        await srv.stop()
+
+
+async def test_secret_delete_route(monkeypatch):
+    srv, _ = await _server(monkeypatch)
+    try:
+        port = _port(srv)
+        status, body = await _del(port, "/secret/EXISTING", token="tok123")
+        assert status == 200 and body["deleted"] is True
+        status, _ = await _del(port, "/secret/EXISTING", token="tok123")
+        assert status == 404  # already gone
+        status, _ = await _del(port, "/secret/NOPE", token="tok123")
+        assert status == 404
+        status, _ = await _del(port, "/secret/NOPE", token="wrong")
+        assert status == 401
     finally:
         await srv.stop()
 

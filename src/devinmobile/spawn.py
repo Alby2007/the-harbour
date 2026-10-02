@@ -59,6 +59,8 @@ async def spawn_session(
     chain: dict | None = None,
     attachment_urls: list[str] | None = None,
     spawned_by: str = "",
+    session_secrets: list[dict[str, str]] | None = None,
+    playbook_id: str | None = None,
 ) -> tuple[Session, discord.Thread]:
     """Create a Devin session + its Discord thread + binding.
 
@@ -135,6 +137,17 @@ async def spawn_session(
     model_label: str | None = None
     # model beats mode; the env default only applies when neither is given
     effective_model = model or (bot.settings.default_model if mode is None else None)
+    if session_secrets or playbook_id:
+        # v3-only fields — the bridge create has neither, so routing these
+        # through it would silently drop them. An explicit model: is a
+        # caller error; an env default just yields to the v3 path.
+        if model:
+            raise SpawnError(
+                "`model:` can't combine with playbooks/session secrets — "
+                "model selection rides the ACP bridge, which supports "
+                "neither field."
+            )
+        effective_model = None
     if effective_model:
         # Model selection needs the ACP bridge (CLI credentials); v3 only
         # exposes devin_mode.
@@ -184,6 +197,8 @@ async def spawn_session(
                 ),
                 create_as_user_id=create_as,
                 attachment_urls=attachment_urls,
+                session_secrets=session_secrets,
+                playbook_id=playbook_id,
             )
         except Exception as e:
             raise SpawnError(f"Session create failed: `{e}`") from e
