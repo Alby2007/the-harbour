@@ -122,6 +122,7 @@ def classify_transition(
     old_detail: str | None,
     session: Session,
     last_devin_msg: str | None = None,
+    msg_fresh: bool = False,
 ) -> Notification | None:
     s, d = session.status, session.status_detail
     if s != old_status:
@@ -144,6 +145,13 @@ def classify_transition(
             # fires on every turn end — only call it "asking" when the last
             # message really is a question
             if last_devin_msg and last_devin_msg.rstrip().endswith("?"):
+                if msg_fresh:
+                    # the question was just relayed into the thread — the
+                    # ping still fires (it's the push) but quoting it again
+                    # would post the same text twice back to back
+                    return Notification(
+                        "input", "Devin is asking a question ⤴"
+                    )
                 excerpt = last_devin_msg.strip()[-240:]
                 return Notification("input", f"Devin is asking: “{excerpt}”")
             return Notification(
@@ -239,6 +247,7 @@ class Relay:
     async def _poll(self, binding: Binding) -> None:
         cursor = binding.msg_cursor
         had_activity = False
+        msg_fresh = False
         while True:
             page = await self.devin.list_messages(binding.session_id, after=cursor)
             for m in relayable(page.items, binding.seen_event_ids):
@@ -249,6 +258,7 @@ class Relay:
                     # LATER tick still sees the question text — the message and
                     # the status change routinely land in different polls
                     binding.last_msg = clean
+                    msg_fresh = True
                 await self._relay_message(binding, m)
             if page.end_cursor:
                 cursor = page.end_cursor
@@ -260,7 +270,8 @@ class Relay:
         await self._sync_prs(binding, session)
         await self._typing(binding, session)
         notif = classify_transition(
-            binding.status, binding.status_detail, session, binding.last_msg
+            binding.status, binding.status_detail, session, binding.last_msg,
+            msg_fresh=msg_fresh,
         )
         had_activity = had_activity or notif is not None
         if had_activity:

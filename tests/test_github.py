@@ -617,6 +617,35 @@ async def test_question_detection_survives_split_ticks(tmp_path):
     await db.close()
 
 
+async def test_question_ping_no_duplicate_when_same_tick(tmp_path):
+    """Message AND the waiting_for_user flip in one poll — the ping fires
+    but must not re-quote a message that's sitting right above it."""
+    db = await Database.connect(str(tmp_path / "t.db"))
+    binding = Binding(session_id="s1", thread_id=10, channel_id=1,
+                      status="running", status_detail="working")
+    await db.upsert_binding(binding)
+    thread = _RelayThread()
+    relay = Relay(SimpleNamespace(get_channel=lambda _id: thread),
+                  _FakeDevin(Session(session_id="s1", url="u",
+                                     status="running",
+                                     status_detail="waiting_for_user")),
+                  db, _settings())
+    async def _t(_b):
+        return thread
+    relay._thread = _t
+    relay.devin.queued = [SessionMessage(
+        event_id="e1", source="devin", created_at=1,
+        message="Two config files — which one should I use?",
+    )]
+    await relay.poll_binding(binding)
+    texts = [str(a[0]) for a, _ in thread.sent if a]
+    # the question itself was relayed once…
+    assert sum("which one should I use?" in t for t in texts) == 1
+    # …and the ping mentions it without re-quoting the text
+    assert any("asking" in t for t in texts)
+    await db.close()
+
+
 async def test_typing_while_working_not_when_waiting(tmp_path):
     db = await Database.connect(str(tmp_path / "t.db"))
     binding = Binding(session_id="s1", thread_id=10, channel_id=1)
