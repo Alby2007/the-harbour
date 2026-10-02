@@ -290,7 +290,9 @@ class Relay:
             # an armed auto-merge PR on a dead session still needs polling
             # — that's the mechanism that fires the merge once CI greens
             binding.active = True
-        if session.title:
+        if session.title and not binding.title:
+            # first-fill only — a spawn/rename-set binding.title is user
+            # intent and must survive the session's auto-title churn
             binding.title = session.title
         binding.status = session.status
         binding.status_detail = session.status_detail

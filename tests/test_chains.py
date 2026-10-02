@@ -569,6 +569,26 @@ async def test_chain_next_double_tap_spawns_once(tmp_path):
     assert any("already moved on" in m for m in msgs)
 
 
+async def test_chain_next_ignores_deleted_binding(tmp_path):
+    """/delete on a pending chain phase must not respawn via a stale
+    Continue→ tap — the tap answers ephemerally like a consumed marker."""
+    db = await _db(tmp_path)
+    await db.upsert_binding(
+        _binding(chain=_chain(pending=1), status="exit", deleted=True)
+    )
+    bot = _Bot()
+    bot.db = db
+    bot.devin = _Dev()
+    bot.relay = _AdvanceStub(db)
+    bot.github = None
+    ix = _Ix()
+    await DevinMobileBot.handle_component(
+        bot, ix, "chain_next", "s1", None  # type: ignore[arg-type]
+    )
+    assert bot.relay.calls == []
+    assert any("already moved on" in m for m in ix.response.sent)
+
+
 async def test_chain_next_stale_chain_is_ephemeral(tmp_path):
     db = await _db(tmp_path)
     await db.upsert_binding(_binding(chain=_chain()))  # pending=None

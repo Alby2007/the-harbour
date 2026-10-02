@@ -371,7 +371,9 @@ class DevinMobileBot(discord.Client):
         ):
             return
         binding = await self.db.get_binding_by_thread(event.channel_id)
-        if binding is None:
+        # deleted bindings are inert — a 👍 here would send_message into a
+        # terminated session and could resume it
+        if binding is None or binding.deleted:
             return
         chan = self.get_channel(event.channel_id) or await self.fetch_channel(
             event.channel_id
@@ -565,6 +567,7 @@ class DevinMobileBot(discord.Client):
         elif action == "chain_next":
             if (
                 binding is None
+                or binding.deleted
                 or not binding.chain
                 or binding.chain.get("pending") is None
             ):
@@ -580,6 +583,7 @@ class DevinMobileBot(discord.Client):
                 binding = await self.db.get_binding(session_id)
                 if (
                     binding is None
+                    or binding.deleted
                     or not binding.chain
                     or binding.chain.get("pending") is None
                 ):

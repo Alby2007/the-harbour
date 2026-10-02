@@ -9,7 +9,8 @@ from devinmobile.bot.commands import register_commands
 from devinmobile.bot.main import DevinMobileBot
 from devinmobile.db import Binding, Database
 from devinmobile.embeds import status_embed
-from devinmobile.models import Session
+from devinmobile.models import MessagePage, Session
+from devinmobile.relay import Relay
 
 
 async def _db(tmp_path) -> Database:
@@ -293,6 +294,73 @@ async def test_rename_updates_thread_and_binding(tmp_path, monkeypatch):
     assert "Renamed" in ix.response.sent[0]
 
 
+class _PollDevin:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    async def get_session(self, sid):
+        return self.session
+
+    async def list_messages(self, sid, after=None):
+        return MessagePage(items=[])
+
+
+class _PollThread:
+    def __init__(self):
+        self.sent: list = []
+
+    async def send(self, *a, **kw):
+        self.sent.append((a, kw))
+        return SimpleNamespace(id=1)
+
+    async def fetch_message(self, mid):
+        async def _edit(**kw):
+            pass
+
+        return SimpleNamespace(id=mid, edit=_edit)
+
+    def typing(self):
+        async def _noop():
+            pass
+
+        return _noop()
+
+
+async def test_rename_survives_poll_title_churn(tmp_path):
+    """Regression: _poll used to copy session.title over binding.title every
+    tick — a /rename on a live session reverted within seconds. Session
+    titles are now first-fill only; a set binding.title is user intent."""
+    db = await _db(tmp_path)
+    await _seed(db)  # binding.title = "old title"
+    thread = _PollThread()
+    relay = Relay(
+        SimpleNamespace(get_channel=lambda _id: thread),
+        _PollDevin(Session(
+            session_id="s1", url="u", status="running",
+            status_detail="working", title="auto churn",
+        )),
+        db,
+        SimpleNamespace(
+            allowed_user_id_set={1}, max_acu_limit=0,
+            silence_alert_minutes=0,
+        ),
+    )
+
+    async def _t(_b):
+        return thread
+
+    relay._thread = _t  # type: ignore[method-assign]
+    binding = await db.get_binding("s1")
+    await relay.poll_binding(binding)
+    assert binding.title == "old title"
+
+    # first-fill still works — an untitled binding picks the session's up
+    await db.upsert_binding(_b("s2"))
+    binding2 = await db.get_binding("s2")
+    await relay.poll_binding(binding2)
+    assert binding2.title == "auto churn"
+
+
 def test_status_embed_binding_title_wins():
     """/rename must be VISIBLE — a user-set title beats Devin's
     auto-title on the embed."""
@@ -336,3 +404,35 @@ async def test_on_message_ignores_deleted_binding(tmp_path):
     )
     await bot.on_message(msg)
     assert not calls  # deleted binding → no steering, no reactivation
+
+
+async def test_reaction_ignores_deleted_binding(tmp_path):
+    """The on_message guard isn't enough — a 👍 on a deleted anchor would
+    send_message into the terminated session and could resume it. The
+    reaction path must drop deleted bindings before dispatching."""
+    db = await _db(tmp_path)
+    await db.upsert_binding(_b("s1", deleted=True, active=True))
+    bot = DevinMobileBot.__new__(DevinMobileBot)
+    bot.db = db
+    bot.settings = SimpleNamespace(is_operator=lambda *a, **kw: True)
+    calls: list = []
+
+    async def _spy(*a, **kw):
+        calls.append(a)
+
+    bot._handle_reaction = _spy
+
+    async def _boom(_id):
+        raise AssertionError("fetch reached — guard didn't bite")
+
+    bot.get_channel = lambda _id: None
+    bot.fetch_channel = _boom
+    event = SimpleNamespace(
+        emoji=SimpleNamespace(name="👍"),
+        user_id=1,
+        member=None,
+        channel_id=1,   # _b default thread_id — resolves the deleted row
+        message_id=9,
+    )
+    await bot.on_raw_reaction_add(event)
+    assert not calls
