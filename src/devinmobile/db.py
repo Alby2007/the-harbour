@@ -665,12 +665,14 @@ class Database:
             (since,),
         ) as cur:
             busy = {
-                repo.strip()
+                repo.strip().lower()
                 for (csv,) in await cur.fetchall()
                 for repo in (csv or "").split(",")
                 if repo.strip()
             }
-        return sorted(known - busy)[:limit]
+        # subtract case-insensitively but keep `known`'s written case —
+        # repo_notes casing and canonical binding repos can disagree
+        return sorted(r for r in known if r.lower() not in busy)[:limit]
 
     # ---- repo notes ---------------------------------------------------------
 

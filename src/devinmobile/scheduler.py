@@ -118,11 +118,13 @@ class Scheduler:
                     "monitor #%d %s unknown: %s", s.id, s.watch, result.detail
                 )
             elif result.state == "ok":
+                # state flip BEFORE the post — a dead hub channel can't
+                # leave the monitor stuck "red" and refiring
+                await self.bot.db.update_watch(s.id, "green")
                 if s.watch_state == "red":
                     await self._post_hub(
                         f"✅ Monitor recovered: `{s.watch}` — {result.detail}"
                     )
-                await self.bot.db.update_watch(s.id, "green")
             else:  # red
                 edge = s.watch_state != "red"
                 cooled = (
@@ -138,18 +140,27 @@ class Scheduler:
                         self.bot,
                         prompt=(
                             f"{s.prompt}\n\n---\nMonitor tripped: {s.watch} "
-                            f"→ {result.detail} at <t:{now}:F>"
+                            f"→ {result.detail} at "
+                            f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))}"
                         ),
                         repos=s.repos or None,
                         model=s.model,
                         title=f"[monitor] {s.watch[:60]}",
                     )
-                    await thread.send(
-                        f"Spawned by monitor schedule #{s.id} "
-                        f"(`{s.watch}` → {result.detail})."
-                    )
-                    await self.bot.db.update_watch(s.id, "red", now)
+                    # bookkeeping BEFORE the provenance post — a failed
+                    # send mustn't hide the spawn from the dedup key or
+                    # re-edge the monitor every tick
                     fired_id = session.session_id
+                    await self.bot.db.update_watch(s.id, "red", now)
+                    try:
+                        await thread.send(
+                            f"Spawned by monitor schedule #{s.id} "
+                            f"(`{s.watch}` → {result.detail})."
+                        )
+                    except Exception:
+                        log.warning(
+                            "monitor #%d provenance post failed", s.id
+                        )
                 else:
                     # still red but suppressed — persist state only
                     log.info(
@@ -160,6 +171,10 @@ class Scheduler:
                     await self.bot.db.update_watch(s.id, "red")
         except SpawnError as e:
             log.warning("monitor #%d spawn failed: %s", s.id, e)
+            # record the attempt as red+fired — otherwise the edge stays
+            # fresh and a permanently-broken spawn path retries every
+            # interval, ignoring cooldown entirely
+            await self.bot.db.update_watch(s.id, "red", now)
         except Exception:
             log.exception("monitor #%d crashed", s.id)
         finally:

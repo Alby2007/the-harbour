@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .db import Database
 
 _WAITING = {"waiting_for_user", "waiting_for_approval"}
+_TERMINAL = {"exit", "error", "suspended"}  # same set as relay.QUIET_STATUSES
 
 
 def _line(b: Binding, extra: str = "") -> str:
@@ -124,7 +125,11 @@ async def build_inbox_embed(db: Database) -> discord.Embed:
         if s.kind == "monitor" and s.watch_state == "red"
     ]
     open_prs = await db.open_prs()
-    running_n = sum(1 for b in rows if b.active)
+    # active=1 on a terminal status = an armed-PR zombie kept polling for
+    # the merge — still polling, not "running"
+    running_n = sum(
+        1 for b in rows if b.active and b.status not in _TERMINAL
+    )
     suggestions = (
         [] if (waiting or errored or pending_chains or red_monitors or open_prs)
         else await db.idle_repos(int(time.time()) - 7 * 86400, limit=2)

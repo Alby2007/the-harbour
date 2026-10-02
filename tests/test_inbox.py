@@ -92,6 +92,11 @@ async def test_inbox_gather_filters(tmp_path):
         "chain1", status="exit", active=False, created_at=now,
         chain={"pending": 1, "playbook": "janitor"},
     ))
+    # exited but still polling for an armed auto-merge — a zombie, not
+    # "running" for the footer count
+    await db.upsert_binding(_b(
+        "zombie", status="exit", active=True, created_at=now,
+    ))
     await db.add_schedule(ScheduleRow(
         id=0, prompt="x", kind="monitor", watch="https://h",
         watch_state="red",
@@ -107,9 +112,9 @@ async def test_inbox_gather_filters(tmp_path):
         "Monitors red (1)", "Open PRs (1)",
     ]
     # err-old suppressed by its continuation child; running child isn't
-    # "waiting", just counted
+    # "waiting", just counted — and the armed-PR zombie isn't "running"
     assert "Errored (1)" in names and "Errored (2)" not in names
-    assert "running" in (embed.footer.text or "")
+    assert "2 running" in (embed.footer.text or "")
 
 
 async def test_inbox_idle_suggestions(tmp_path):

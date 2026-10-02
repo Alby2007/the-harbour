@@ -35,7 +35,25 @@ def test_parse_watch():
 class _Resp:
     def __init__(self, status=200, text="ok"):
         self.status_code = status
-        self.text = text
+        self._text = text
+        self.charset_encoding = "utf-8"
+
+    async def aiter_bytes(self, _n):
+        yield self._text.encode()
+
+
+class _FakeStream:
+    """client.stream() returns an async ctx mgr, not a coroutine."""
+    def __init__(self, resp=None, exc=None):
+        self.resp, self.exc = resp, exc
+
+    async def __aenter__(self):
+        if self.exc:
+            raise self.exc
+        return self.resp
+
+    async def __aexit__(self, *a):
+        return None
 
 
 class _FakeHttp:
@@ -48,10 +66,8 @@ class _FakeHttp:
     async def __aexit__(self, *a):
         return None
 
-    async def get(self, url, **kw):
-        if self.exc:
-            raise self.exc
-        return self.resp
+    def stream(self, *a, **kw):
+        return _FakeStream(self.resp, self.exc)
 
 
 def _http(monkeypatch, resp=None, exc=None):
@@ -181,9 +197,12 @@ async def test_monitor_red_edge_fires(tmp_path, monkeypatch):
     _stub_spawn(monkeypatch, calls)
     await Scheduler(_Bot(db))._fire_due()  # type: ignore[arg-type]
     assert len(calls) == 1
-    # the fix prompt carries the evidence block
+    # the fix prompt carries the evidence block — human timestamp, not
+    # Discord markup Devin can't render
     assert "Monitor tripped" in calls[0]["prompt"]
     assert "HTTP 503" in calls[0]["prompt"]
+    assert "<t:" not in calls[0]["prompt"]
+    assert "UTC" in calls[0]["prompt"]
     assert calls[0]["title"] == "[monitor] https://x/health"
     row = (await db.all_schedules())[0]
     assert row.watch_state == "red"
@@ -261,6 +280,78 @@ async def test_monitor_unknown_no_spawn(tmp_path, monkeypatch):
     _stub_spawn(monkeypatch, calls)
     await Scheduler(_Bot(db))._fire_due()  # type: ignore[arg-type]
     assert not calls
+
+
+async def test_monitor_spawn_failure_marks_red(tmp_path, monkeypatch):
+    """A broken spawn path records red+the attempt — cooldown becomes the
+    retry floor instead of a fresh edge every interval."""
+    from devinmobile.spawn import SpawnError
+
+    db = await _db(tmp_path)
+    await _monitor_row(db)
+    _stub_check(monkeypatch, "red")
+
+    async def _boom(bot, **kw):
+        raise SpawnError("HUB_CHANNEL_ID is not configured.")
+
+    monkeypatch.setattr(sched_mod, "spawn_session", _boom)
+    await Scheduler(_Bot(db))._fire_due()  # type: ignore[arg-type]
+    row = (await db.all_schedules())[0]
+    assert row.watch_state == "red"
+    assert row.last_fired_at is not None
+    assert not row.last_session_id  # nothing spawned
+
+
+async def test_monitor_send_failure_no_restrike(tmp_path, monkeypatch):
+    """thread.send raising after spawn must not re-edge the monitor —
+    the spawn is still recorded so the next tick is suppressed."""
+    db = await _db(tmp_path)
+    await _monitor_row(db)
+    _stub_check(monkeypatch, "red")
+    calls: list = []
+
+    async def _spawn(bot, **kw):
+        calls.append(kw)
+
+        class _T:
+            async def send(self, *a, **kw):
+                raise RuntimeError("thread deleted mid-send")
+
+        return Session(session_id="fix1", url="u", status="running"), _T()
+
+    monkeypatch.setattr(sched_mod, "spawn_session", _spawn)
+    sched = Scheduler(_Bot(db))
+    await sched._fire_due()
+    assert len(calls) == 1
+    row = (await db.all_schedules())[0]
+    # the spawn IS recorded despite the provenance post crashing —
+    # watch_state red + last_fired_at + last_session_id all landed
+    assert row.watch_state == "red"
+    assert row.last_fired_at is not None
+    assert row.last_session_id == "fix1"
+    # next tick inside cooldown: not an edge, not cooled → suppressed
+    calls.clear()
+    await sched._fire_monitor(row, int(time.time()))
+    assert not calls
+
+
+async def test_monitor_recovery_post_failure_still_greens(
+    tmp_path, monkeypatch
+):
+    """A dead hub channel can't wedge watch_state at 'red' — the state
+    flip lands before the recovery post."""
+    db = await _db(tmp_path)
+    await _monitor_row(db, watch_state="red")
+    _stub_check(monkeypatch, "ok")
+
+    class _DeadHub(_Chan):
+        async def send(self, *a, **kw):
+            raise RuntimeError("channel deleted")
+
+    bot = _Bot(db)
+    bot.hub = _DeadHub()
+    await Scheduler(bot)._fire_due()  # type: ignore[arg-type]
+    assert (await db.all_schedules())[0].watch_state == "green"
 
 
 # ---- /schedule monitor validation ---------------------------------------------

@@ -22,6 +22,10 @@ log = logging.getLogger(__name__)
 
 CI_WATCH_RE = re.compile(r"^ci:([\w.-]+)/([\w.-]+)(?:@([\w./-]+))?$")
 
+# a watch on a huge body shouldn't download it whole each tick; `expect`
+# is matched inside the first _BODY_CAP bytes only
+_BODY_CAP = 512 * 1024
+
 
 @dataclass
 class Check:
@@ -61,18 +65,27 @@ async def run_check(
     _, url = parsed
     try:
         async with httpx.AsyncClient() as http:
-            resp = await http.get(url, timeout=15, follow_redirects=True)
+            # stream + cap — a watch pointed at a huge endpoint shouldn't
+            # pull the whole body every interval; `expect` must appear
+            # within the first _BODY_CAP bytes
+            async with http.stream(
+                "GET", url, timeout=15, follow_redirects=True
+            ) as resp:
+                status = resp.status_code
+                encoding = resp.charset_encoding or "utf-8"
+                buf = b""
+                async for chunk in resp.aiter_bytes(65536):
+                    buf += chunk
+                    if len(buf) >= _BODY_CAP:
+                        break
     except httpx.TimeoutException:
         # a down endpoint IS the signal — transport errors are red
         return Check("red", "timeout after 15s")
     except httpx.HTTPError as e:
         return Check("red", f"transport error: {e}")
-    if resp.status_code >= 300:
-        return Check(
-            "red", f"HTTP {resp.status_code} — {resp.text[:300]!r}"
-        )
-    if expect and expect not in resp.text:
-        return Check(
-            "red", f"body missing {expect!r} — {resp.text[:300]!r}"
-        )
-    return Check("ok", f"HTTP {resp.status_code}")
+    text = buf.decode(encoding, errors="replace")
+    if status >= 300:
+        return Check("red", f"HTTP {status} — {text[:300]!r}")
+    if expect and expect not in text:
+        return Check("red", f"body missing {expect!r} — {text[:300]!r}")
+    return Check("ok", f"HTTP {status}")
