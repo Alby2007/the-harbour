@@ -394,6 +394,11 @@ async def test_schedule_monitor_validation(tmp_path):
             "allowed_user_id_set": {1},
             "max_acu_limit": 25,
             "github_enabled": False,
+            "admin_user_id_set": frozenset(),
+            "is_operator": (
+                lambda self, uid, role_ids=():
+                uid in self.allowed_user_id_set
+            ),
         },
     )()
     register_commands(bot)

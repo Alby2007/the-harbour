@@ -136,6 +136,11 @@ cp .env.example .env
 | `TASK_INTAKE_TOKEN` | no | Bearer token enabling `POST /task` (curl/Siri/Raycast → spawn session) on the webhook port; empty = off. Same exposure as the webhook secret — keep behind the same tunnel |
 | `TASK_INTAKE_TOKENS` | no | Per-client bearers `tok:name` (comma-separated) — mapped tokens attribute sessions to the name and ignore the payload's `by:` field. Composes with `TASK_INTAKE_TOKEN` |
 | `DEVIN_USER_MAP` | no | `discord-id:devin-user-id` pairs — a mapped spawner's v3 sessions are created AS their Devin user (needs ImpersonateOrgSessions). Bridge sessions can't remap |
+| `REQUIRED_ROLE_ID` | no | Guild role that grants operator access — access = `ALLOWED_USER_IDS` ∪ role ∪ `/allow` list. DMs stay allowlist-only |
+| `GITHUB_USER_MAP` | no | `github-login:discord-id` pairs — label-applied spawns attribute to the teammate who labeled (else the shared `github` marker) |
+| `USER_ACU_DAILY` | no | Per-user ACU quota per rolling 24h, session-start attribution; `0` = off. Marker spawnings exempt |
+| `TEAM_ADMIN_IDS` | no | Comma-separated admin snowflakes — owner-or-admin required for destructive ops on another user's resource; unlocks `/allow` `/deny`. Empty = flat trust |
+| `HUB_CHANNEL_MAP` | no | `discord-id:channel-id` lanes — a mapped user's threads open in their channel; channel perms are the privacy boundary |
 | `DEVIN_DEFAULT_MODEL` | no | Route every `/devin` through the bridge model unless `model:`/`mode:` is given |
 | `ACP_PROGRESS` | no | Live "Working…" tool-call streaming via the bridge (default on; `0` disables) |
 | `AUTO_RESPAWN` | no | Errored sessions respawn once as seeded continuations (default on; `0` disables) |

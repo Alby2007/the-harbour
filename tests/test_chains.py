@@ -28,6 +28,10 @@ class _Settings:
     silence_alert_minutes = 0
     create_as_user_id = None
     github_merge_method = "squash"
+    admin_user_id_set = frozenset()
+
+    def is_operator(self, user_id, role_ids=()):
+        return user_id in self.allowed_user_id_set
 
 
 class _Chan:

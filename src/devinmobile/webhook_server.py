@@ -43,8 +43,18 @@ class WebhookServer:
         # token → caller-name map (TASK_INTAKE_TOKENS) — a mapped token's
         # session attributes to the name instead of the bare "intake"
         self.task_token_map = settings.task_intake_token_map
+        # github-login → discord-id (GITHUB_USER_MAP): a mapped teammate's
+        # label-applied spawns attribute to THEM (owner pings), unmapped
+        # senders keep the shared "github" marker
+        self.gh_user_map = settings.github_user_id_map
         self.port = settings.github_webhook_port
         self._runner: web.AppRunner | None = None
+
+    def _sender_owner(self, payload: dict) -> str:
+        """payload.sender.login → mapped discord id, else the 'github'
+        marker (all-allowlist pings)."""
+        login = ((payload.get("sender") or {}).get("login")) or ""
+        return self.gh_user_map.get(login, "github")
 
     def _verify(self, body: bytes, signature: str | None) -> bool:
         if not signature or not signature.startswith("sha256="):
@@ -295,7 +305,7 @@ class WebhookServer:
         try:
             _, thread = await spawn_session(
                 self.bot, prompt=prompt, repos=[f"{owner}/{name}"],
-                title=title, spawned_by="github",
+                title=title, spawned_by=self._sender_owner(payload),
             )
             await thread.send(
                 f"Spawned by `{label}` label on {owner}/{name}#{issue['number']}."
@@ -340,7 +350,7 @@ class WebhookServer:
             _, thread = await spawn_session(
                 self.bot, prompt=prompt, repos=[f"{owner}/{name}"],
                 title=f"Review {name}#{number}", review_of=key,
-                spawned_by="github",
+                spawned_by=self._sender_owner(payload),
             )
             await thread.send(
                 f"Spawned by `{label}` label on {key} — review findings will "

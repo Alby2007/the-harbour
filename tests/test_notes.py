@@ -19,6 +19,13 @@ class _Settings:
     hub_channel_id = 42
     default_model = None
     devin_mode = "normal"
+    # small-team fields reached by spawn_session's body
+    user_acu_daily = 0.0
+    hub_channel_id_map: dict = {}
+    admin_user_id_set = frozenset()
+
+    def is_operator(self, user_id, role_ids=()):
+        return user_id in self.allowed_user_id_set
 
 
 class _Chan:

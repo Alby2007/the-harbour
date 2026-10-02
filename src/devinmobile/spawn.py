@@ -64,9 +64,35 @@ async def spawn_session(
 
     Raises SpawnError for anything the caller should surface to the user.
     """
-    hub_id = bot.settings.hub_channel_id
+    # Per-user hub lane (HUB_CHANNEL_MAP): a mapped user's sessions open
+    # in their channel, not the shared hub — channel perms are the actual
+    # privacy boundary, the bot just picks the channel. Same allowlist
+    # gate as devin_user_map: a caller-supplied /task `by:` can't redirect
+    # sessions into someone else's lane. Markers/legacy → default hub.
+    lane = (
+        bot.settings.hub_channel_id_map.get(int(spawned_by))
+        if spawned_by.isdigit()
+        and int(spawned_by) in bot.settings.allowed_user_id_set
+        else None
+    )
+    hub_id = lane or bot.settings.hub_channel_id
     if hub_id is None:
         raise SpawnError("HUB_CHANNEL_ID is not configured.")
+
+    # Per-user ACU quota (USER_ACU_DAILY, 0=off) — session-start
+    # attribution over a rolling 24h. Marker spawned_by is exempt: team
+    # infra (label spawns, /task intake) isn't a user.
+    quota = bot.settings.user_acu_daily or 0
+    if quota > 0 and spawned_by.isdigit():
+        spent = await bot.db.acu_by_user(
+            spawned_by, int(time.time()) - 86400
+        )
+        if spent >= quota:
+            raise SpawnError(
+                f"daily ACU quota {quota:g} reached — "
+                f"{spent:g} ACU spent in 24h"
+            )
+
     chan = bot.get_channel(hub_id) or await bot.fetch_channel(hub_id)
     if not isinstance(chan, discord.TextChannel):
         raise SpawnError("HUB_CHANNEL_ID is not configured or isn't a text channel.")

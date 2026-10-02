@@ -17,7 +17,12 @@ from ..scheduler import Scheduler
 from ..spawn import SpawnError, spawn_session
 from ..views import CompletionView, MergeConfirmView, dispatch
 from ..webhook_server import WebhookServer, maybe_start
-from .commands import register_commands
+from .commands import (
+    _is_operator,
+    _may_destroy,
+    register_commands,
+    user_role_ids,
+)
 
 log = logging.getLogger(__name__)
 
@@ -133,7 +138,9 @@ class DevinMobileBot(discord.Client):
         binding = await self.db.get_binding_by_thread(message.channel.id)
         if binding is None:
             return
-        if message.author.id not in self.settings.allowed_user_id_set:
+        if not await _is_operator(
+            self, message.author.id, user_role_ids(message.author)
+        ):
             return
         content = message.content
         attachments = [a.url for a in message.attachments] or None
@@ -223,7 +230,9 @@ class DevinMobileBot(discord.Client):
     _DM_HINT = "DM me `devin: <task>` or attach a file to start a session."
 
     async def _dm_intake(self, message: discord.Message) -> None:
-        if message.author.id not in self.settings.allowed_user_id_set:
+        # DM contexts carry no Member.roles — allowlist ∪ db only, a
+        # guild role can't grant DM access
+        if not await _is_operator(self, message.author.id):
             return  # silence — a stranger's DM dies quietly
         content = (message.content or "").strip()
         attachments = list(message.attachments)
@@ -351,7 +360,10 @@ class DevinMobileBot(discord.Client):
     _REACT_EMOJI = frozenset({"👍", "🔁", "⏸️"})
 
     async def on_raw_reaction_add(self, event: discord.RawReactionActionEvent) -> None:
-        if event.user_id not in self.settings.allowed_user_id_set:
+        # event.member is a Member in guilds, None in DMs (id-only there)
+        if not await _is_operator(
+            self, event.user_id, user_role_ids(event.member)
+        ):
             return
         emoji = event.emoji.name or ""
         if emoji not in self._REACT_EMOJI:
@@ -368,10 +380,10 @@ class DevinMobileBot(discord.Client):
             msg = await chan.fetch_message(event.message_id)
         except (discord.HTTPException, AttributeError):
             return
-        await self._handle_reaction(binding, msg, emoji)
+        await self._handle_reaction(binding, msg, emoji, event.user_id)
 
     async def _handle_reaction(
-        self, binding, msg: discord.Message, emoji: str
+        self, binding, msg: discord.Message, emoji: str, user_id: int
     ) -> None:
         is_anchor = msg.id == binding.anchor_msg_id
         pr_row = (
@@ -429,6 +441,14 @@ class DevinMobileBot(discord.Client):
                     await self.relay.progress.thinking(binding)
                     self.relay.request_poll(binding)
             elif emoji == "⏸️" and is_anchor:
+                # same destructive-op gate as /kill — parking someone
+                # else's session needs owner-or-admin
+                if not _may_destroy(self.settings, user_id, binding.spawned_by):
+                    await msg.channel.send(
+                        "⏸️ only the owner or an admin can park this "
+                        "session."
+                    )
+                    return
                 binding.active = False
                 await self.db.upsert_binding(binding)
                 await msg.channel.send(
@@ -455,7 +475,9 @@ class DevinMobileBot(discord.Client):
         session_id: str,
         extra: str | None = None,
     ) -> None:
-        if interaction.user.id not in self.settings.allowed_user_id_set:
+        if not await _is_operator(
+            self, interaction.user.id, user_role_ids(interaction.user)
+        ):
             if not interaction.response.is_done():
                 await interaction.response.send_message(
                     "This bot is locked to its owner.", ephemeral=True

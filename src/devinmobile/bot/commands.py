@@ -103,6 +103,35 @@ def _split_repos(repo: str | None) -> list[str] | None:
     return [r.strip() for r in repo.split(",") if r.strip()] if repo else None
 
 
+def user_role_ids(user) -> list[int]:
+    """Snowflakes from `Member.roles`; a DM `User` (and `None`) carries
+    none — DM access is always allowlist/db-only, no role shortcut."""
+    return [r.id for r in getattr(user, "roles", ())]
+
+
+async def _is_operator(bot: "DevinMobileBot", user_id: int, role_ids=()) -> bool:
+    """The union that every gate checks: env allowlist ∪ REQUIRED_ROLE_ID
+    (guild only) ∪ the runtime-allowed db table (/allow rows)."""
+    if bot.settings.is_operator(user_id, role_ids):
+        return True
+    return await bot.db.is_allowed_user(user_id)
+
+
+def _may_destroy(settings, actor_id: int, owner: str) -> bool:
+    """Owner-or-admin gate for destructive ops on someone else's resource.
+
+    TEAM_ADMIN_IDS unset → flat trust (the solo default — no gate at all).
+    Marker/legacy owners ('', 'github', 'intake', token names) are shared
+    infra — nobody's resource, so nobody gates them."""
+    admins = settings.admin_user_id_set
+    if not admins or not owner.isdigit() or owner == str(actor_id):
+        return True
+    return actor_id in admins
+
+
+_OWNER_OR_ADMIN = "That belongs to someone else — owner or admin only."
+
+
 def usage_summary(bindings: list[Binding], now: float) -> dict:
     """Aggregate per-session ACU burn for /usage.
 
@@ -147,8 +176,10 @@ def usage_summary(bindings: list[Binding], now: float) -> dict:
 def register_commands(bot: "DevinMobileBot") -> None:
     tree = bot.tree
 
-    def _allowed(interaction: discord.Interaction) -> bool:
-        return interaction.user.id in bot.settings.allowed_user_id_set
+    async def _allowed(interaction: discord.Interaction) -> bool:
+        return await _is_operator(
+            bot, interaction.user.id, user_role_ids(interaction.user)
+        )
 
     @tree.command(name="devin", description="Start a Devin Cloud session")
     @app_commands.describe(
@@ -177,7 +208,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         budget: int | None = None,
         attachment: discord.Attachment | None = None,
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         if budget is not None and budget <= 0:
@@ -261,7 +292,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         title: str | None = None,
         attachment: discord.Attachment | None = None,
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         if budget is not None and budget <= 0:
@@ -347,7 +378,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     @tree.command(name="chains", description="List playbook chains")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def chains_cmd(interaction: discord.Interaction) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         rows = await bot.db.chained_bindings()
@@ -407,7 +438,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         title: str | None = None,
         attachment: discord.Attachment | None = None,
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         repo_list = _split_repos(repos) or []
@@ -469,7 +500,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         expect: str | None = None,
         cooldown: str | None = None,
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         kind = kind or "spawn"
@@ -577,7 +608,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
         notes: str | None = None,
         attachment: discord.Attachment | None = None,
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         if not isinstance(interaction.channel, discord.Thread):
@@ -642,7 +673,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     @tree.command(name="schedules", description="List recurring Devin tasks")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def schedules_cmd(interaction: discord.Interaction) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         rows = await bot.db.all_schedules()
@@ -676,17 +707,26 @@ def register_commands(bot: "DevinMobileBot") -> None:
     @app_commands.describe(schedule_id="Schedule id from /schedules")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def unschedule_cmd(interaction: discord.Interaction, schedule_id: int) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
-        if await bot.db.delete_schedule(schedule_id):
-            await interaction.response.send_message(
-                f"Deleted schedule #{schedule_id}.", ephemeral=True
-            )
-        else:
+        row = await bot.db.get_schedule(schedule_id)
+        if row is None:
             await interaction.response.send_message(
                 f"No schedule #{schedule_id}.", ephemeral=True
             )
+            return
+        if not _may_destroy(
+            bot.settings, interaction.user.id, row.spawned_by
+        ):
+            await interaction.response.send_message(
+                _OWNER_OR_ADMIN, ephemeral=True
+            )
+            return
+        await bot.db.delete_schedule(schedule_id)
+        await interaction.response.send_message(
+            f"Deleted schedule #{schedule_id}.", ephemeral=True
+        )
 
     @tree.command(
         name="digest",
@@ -697,7 +737,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     async def digest_cmd(
         interaction: discord.Interaction, hours: int = 24
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         hours = max(1, min(hours, 168))
@@ -709,13 +749,22 @@ def register_commands(bot: "DevinMobileBot") -> None:
         name="inbox",
         description="Triage card — everything waiting on a human tap",
     )
+    @app_commands.describe(
+        mine="Only items you spawned — monitors + open PRs stay shared"
+    )
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def inbox_cmd(interaction: discord.Interaction) -> None:
-        if not _allowed(interaction):
+    async def inbox_cmd(
+        interaction: discord.Interaction, mine: bool = False
+    ) -> None:
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         await interaction.response.send_message(
-            embed=await build_inbox_embed(bot.db), ephemeral=True
+            embed=await build_inbox_embed(
+                bot.db,
+                owner=str(interaction.user.id) if mine else "",
+            ),
+            ephemeral=True,
         )
 
     @tree.command(
@@ -732,7 +781,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     async def note_cmd(
         interaction: discord.Interaction, text: str, repo: str | None = None
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         target = (repo or "").strip()
@@ -768,7 +817,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     async def notes_cmd(
         interaction: discord.Interaction, repo: str | None = None
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         rows = await bot.db.list_notes(repo)
@@ -789,22 +838,29 @@ def register_commands(bot: "DevinMobileBot") -> None:
     async def unnote_cmd(
         interaction: discord.Interaction, note_id: int
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
-        if await bot.db.delete_note(note_id):
-            await interaction.response.send_message(
-                f"Deleted note #{note_id}.", ephemeral=True
-            )
-        else:
+        owner = await bot.db.note_created_by(note_id)
+        if owner is None:
             await interaction.response.send_message(
                 f"No note #{note_id}.", ephemeral=True
             )
+            return
+        if not _may_destroy(bot.settings, interaction.user.id, owner):
+            await interaction.response.send_message(
+                _OWNER_OR_ADMIN, ephemeral=True
+            )
+            return
+        await bot.db.delete_note(note_id)
+        await interaction.response.send_message(
+            f"Deleted note #{note_id}.", ephemeral=True
+        )
 
     @tree.command(name="sessions", description="List sessions started through this bot")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def sessions_cmd(interaction: discord.Interaction) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         bindings = await bot.db.all_bindings(limit=10)
@@ -835,7 +891,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     async def kill_cmd(
         interaction: discord.Interaction, session: str | None = None
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         binding = None
@@ -847,6 +903,13 @@ def register_commands(bot: "DevinMobileBot") -> None:
             await interaction.response.send_message(
                 "No such session — run inside its thread or pass `session:`.",
                 ephemeral=True,
+            )
+            return
+        if not _may_destroy(
+            bot.settings, interaction.user.id, binding.spawned_by
+        ):
+            await interaction.response.send_message(
+                _OWNER_OR_ADMIN, ephemeral=True
             )
             return
         await interaction.response.defer(ephemeral=True)
@@ -872,7 +935,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     @tree.command(name="usage", description="ACU burn rollup across bot sessions")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def usage_cmd(interaction: discord.Interaction) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         bindings = await bot.db.all_bindings(limit=1000)
@@ -928,7 +991,7 @@ def register_commands(bot: "DevinMobileBot") -> None:
     async def devin_status_cmd(
         interaction: discord.Interaction, session: str | None = None
     ) -> None:
-        if not _allowed(interaction):
+        if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
         binding = None
@@ -949,3 +1012,61 @@ def register_commands(bot: "DevinMobileBot") -> None:
             ),
             ephemeral=True,
         )
+
+    # ---- Runtime allowlist — hard-gated on TEAM_ADMIN_IDS. Without admins
+    # configured the commands refuse entirely: operators must never be able
+    # to grant themselves (or anyone) access by bot command. -------------
+
+    @tree.command(
+        name="allow", description="Grant a user bot access (admin only)"
+    )
+    @app_commands.describe(user="The Discord user to allow")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def allow_cmd(
+        interaction: discord.Interaction, user: discord.User
+    ) -> None:
+        if not bot.settings.admin_user_id_set:
+            await interaction.response.send_message(
+                "No admins configured — set `TEAM_ADMIN_IDS` first "
+                "(or use `ALLOWED_USER_IDS`/`REQUIRED_ROLE_ID`).",
+                ephemeral=True,
+            )
+            return
+        if not bot.settings.is_admin(interaction.user.id):
+            await interaction.response.send_message(
+                "Admins only.", ephemeral=True
+            )
+            return
+        await bot.db.add_allowed_user(user.id, interaction.user.id)
+        await interaction.response.send_message(
+            f"Allowed {user.mention}.", ephemeral=True
+        )
+
+    @tree.command(
+        name="deny", description="Revoke runtime-granted access (admin only)"
+    )
+    @app_commands.describe(user="The Discord user to remove")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def deny_cmd(
+        interaction: discord.Interaction, user: discord.User
+    ) -> None:
+        if not bot.settings.admin_user_id_set:
+            await interaction.response.send_message(
+                "No admins configured — set `TEAM_ADMIN_IDS` first.",
+                ephemeral=True,
+            )
+            return
+        if not bot.settings.is_admin(interaction.user.id):
+            await interaction.response.send_message(
+                "Admins only.", ephemeral=True
+            )
+            return
+        removed = await bot.db.remove_allowed_user(user.id)
+        msg = (
+            f"Removed {user.mention}."
+            if removed
+            else f"{user.mention} isn't on the runtime list."
+        )
+        if user.id in bot.settings.allowed_user_id_set:
+            msg += " (Still allowlisted via `ALLOWED_USER_IDS`.)"
+        await interaction.response.send_message(msg, ephemeral=True)

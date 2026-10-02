@@ -83,6 +83,15 @@ CREATE TABLE IF NOT EXISTS repo_notes (
     created_at  INTEGER NOT NULL,
     UNIQUE(repo, note)           -- dedupe: harvest re-runs can't double-save
 );
+
+-- Runtime-allowlisted operators (/allow, /deny). Unions with
+-- ALLOWED_USER_IDS + REQUIRED_ROLE_ID at the gate — removing a row only
+-- undoes /allow, never env-listed or role-based access.
+CREATE TABLE IF NOT EXISTS allowed_users (
+    discord_id  TEXT PRIMARY KEY,
+    added_by    TEXT,
+    created_at  INTEGER NOT NULL
+);
 """
 
 # Columns added after the initial schema — table -> column -> DDL. Adding a
@@ -269,6 +278,44 @@ class Database:
 
     async def close(self) -> None:
         await self._conn.close()
+
+    # ---- Runtime allowlist (env ∪ role ∪ this table, at the gate) --------
+
+    async def is_allowed_user(self, discord_id) -> bool:
+        async with self._conn.execute(
+            "SELECT 1 FROM allowed_users WHERE discord_id = ?",
+            (str(discord_id),),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def add_allowed_user(self, discord_id, added_by=None) -> None:
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO allowed_users"
+            " (discord_id, added_by, created_at) VALUES (?,?,?)",
+            (str(discord_id), None if added_by is None else str(added_by),
+             int(time.time())),
+        )
+        await self._conn.commit()
+
+    async def remove_allowed_user(self, discord_id) -> bool:
+        """True when a row existed — env-listed ids are never in here."""
+        cur = await self._conn.execute(
+            "DELETE FROM allowed_users WHERE discord_id = ?",
+            (str(discord_id),),
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def acu_by_user(self, spawned_by: str, since: int) -> float:
+        """24h ACU spend for a user — session-start attribution (the
+        /usage caveat: spawned_by stamps at spawn, not over the run)."""
+        async with self._conn.execute(
+            "SELECT COALESCE(SUM(acus), 0) FROM bindings"
+            " WHERE spawned_by = ? AND created_at >= ?",
+            (spawned_by, since),
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row[0]) if row else 0.0
 
     @staticmethod
     def _row_to_binding(row: sqlite3.Row) -> Binding:
@@ -618,6 +665,15 @@ class Database:
         )
         await self._conn.commit()
 
+    async def get_schedule(self, schedule_id: int) -> ScheduleRow | None:
+        """One row — the /unschedule owner-check needs spawned_by before
+        deciding whether the caller may delete it."""
+        async with self._conn.execute(
+            "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return self._row_to_schedule(row) if row else None
+
     async def delete_schedule(self, schedule_id: int) -> bool:
         cur = await self._conn.execute(
             "DELETE FROM schedules WHERE id = ?", (schedule_id,)
@@ -747,6 +803,14 @@ class Database:
             params = ()
         async with self._conn.execute(sql, params) as cur:
             return [(r["id"], r["repo"], r["note"]) for r in await cur.fetchall()]
+
+    async def note_created_by(self, note_id: int) -> str | None:
+        """The note's owner for the /unnote admin gate; None = no row."""
+        async with self._conn.execute(
+            "SELECT created_by FROM repo_notes WHERE id = ?", (note_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else (row["created_by"] or "")
 
     async def delete_note(self, note_id: int) -> bool:
         cur = await self._conn.execute(

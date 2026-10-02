@@ -102,9 +102,13 @@ def build_inbox(
     return embed
 
 
-async def build_inbox_embed(db: Database) -> discord.Embed:
+async def build_inbox_embed(db: Database, owner: str = "") -> discord.Embed:
     """Gather the rows and build the card — shared by /inbox and
-    kind='inbox' schedule fires."""
+    kind='inbox' schedule fires.
+
+    `owner` (a discord snowflake str — /inbox mine:) filters the
+    binding-derived sections to that spawner; monitors and open PRs stay
+    shared — they're team infra, not a personal queue."""
     rows = await db.inbox_bindings()
     waiting = [
         b for b in rows if b.active and (b.status_detail or "") in _WAITING
@@ -121,6 +125,12 @@ async def build_inbox_embed(db: Database) -> discord.Embed:
         b for b in rows
         if b.chain and b.chain.get("pending") is not None
     ]
+    if owner:
+        waiting = [b for b in waiting if b.spawned_by == owner]
+        errored = [b for b in errored if b.spawned_by == owner]
+        pending_chains = [
+            b for b in pending_chains if b.spawned_by == owner
+        ]
     schedules = await db.all_schedules()
     red_monitors = [
         s for s in schedules

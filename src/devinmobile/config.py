@@ -63,6 +63,27 @@ class Settings(BaseSettings):
     # (ACP creates as the CLI-authed user) — spawned_by stays authoritative.
     devin_user_map: str = ""
 
+    # --- Small-team layer — every phase is off until its var is set --------
+    # Access = ALLOWED_USER_IDS ∪ this guild role ∪ the runtime-allowed
+    # db table. A Discord role id; guild-side convenience for adding a
+    # teammate without an env edit + restart. DM contexts still honor the
+    # allowlist only (User objects carry no roles) — keep operators in
+    # ALLOWED_USER_IDS regardless.
+    required_role_id: int | None = None
+    # github-login → discord-id ("alby:123456,…") — teammates who apply the
+    # trigger/review labels get their own spawned_by instead of "github"
+    github_user_map: str = ""
+    # Per-user ACU quota per rolling 24h, session-start attribution; 0=off.
+    # Marker spawned_by values (github/intake/token names) are exempt —
+    # team infra isn't a user.
+    user_acu_daily: float = 0
+    # Destructive ops on someone else's resource (/kill, /unschedule,
+    # /unnote, ⏸️) need owner-or-admin. Empty → flat trust (solo default).
+    admin_user_ids: str = ""
+    # discord-id:channel-id lanes — a mapped (allowlisted) spawner's
+    # sessions open their thread in their own channel instead of the hub.
+    hub_channel_map: str = ""
+
     @staticmethod
     def _parse_map(raw: str) -> dict[str, str]:
         out = {}
@@ -79,6 +100,36 @@ class Settings(BaseSettings):
     @cached_property
     def devin_user_id_map(self) -> dict[str, str]:
         return self._parse_map(self.devin_user_map)
+
+    @cached_property
+    def github_user_id_map(self) -> dict[str, str]:
+        return self._parse_map(self.github_user_map)
+
+    @cached_property
+    def hub_channel_id_map(self) -> dict[int, int]:
+        return {
+            int(k): int(v)
+            for k, v in self._parse_map(self.hub_channel_map).items()
+            if k.isdigit() and v.isdigit()
+        }
+
+    @cached_property
+    def admin_user_id_set(self) -> frozenset[int]:
+        return frozenset(
+            int(x) for x in self.admin_user_ids.split(",") if x.strip()
+        )
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.admin_user_id_set
+
+    def is_operator(self, user_id: int, role_ids=()) -> bool:
+        """env-set ∪ role. The runtime db table joins at the call-site
+        layer (bot._is_operator) — Settings stays sync + db-free."""
+        if user_id in self.allowed_user_id_set:
+            return True
+        return bool(
+            self.required_role_id and self.required_role_id in role_ids
+        )
 
     @cached_property
     def github_enabled(self) -> bool:

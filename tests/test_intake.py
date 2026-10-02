@@ -13,6 +13,7 @@ class _Settings:
     github_webhook_port = 0  # ephemeral — the OS picks the port
     task_intake_token = "tok123"
     task_intake_token_map = {"mapA": "alby", "mapB": "sam"}
+    github_user_id_map: dict = {}
     github_enabled = False
 
 

@@ -81,6 +81,11 @@ approval → anything you type in the thread steers the session.
 - **Guardrails** — per-task `/devin budget:` ACU caps (auto-park at 100%),
   global cap pings, silence watchdog, `/kill` parking, `/usage` burn
   rollup, voice-note steering via Whisper
+- **Small-team layer** — opt-in via env: `REQUIRED_ROLE_ID` guild-role
+  access, `GITHUB_USER_MAP` sender attribution, `USER_ACU_DAILY` per-user
+  ACU quotas, `TEAM_ADMIN_IDS` owner-or-admin gates on destructive ops,
+  `HUB_CHANNEL_MAP` per-user thread lanes, `/allow` `/deny` runtime
+  allowlist, `/inbox mine:`
 - **Presence** — the bot's Discord status shows `N Devin sessions running`
 - **Diff-on-phone** — completion cards attach the PR's `.diff` file so the
   actual change is readable without opening GitHub

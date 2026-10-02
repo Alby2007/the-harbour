@@ -271,3 +271,17 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   non-daemon — tests that skip `db.close()` leave pytest unable to exit
   (zombie processes accumulate). `tests/conftest.py` auto-closes every
   opened connection; keep new tests inside that convention.
+- Small-team layer — every phase opt-in, off by default. Operator check is
+  `commands._is_operator`: `ALLOWED_USER_IDS` ∪ `REQUIRED_ROLE_ID`
+  (guild-side only — DM `User` objects carry no roles, so DM access is
+  id-only) ∪ the `allowed_users` db table. `/allow` `/deny` refuse entirely
+  when `TEAM_ADMIN_IDS` is unset — runtime granting needs admins, or
+  operators could self-escalate. Destructive ops on another user's
+  resource (`/kill`, `/unschedule`, `/unnote`, the ⏸️ anchor reaction)
+  need owner-or-admin once `TEAM_ADMIN_IDS` is set; marker `spawned_by`
+  values (`github`/`intake`/token names) stay shared infra, never gated.
+  `USER_ACU_DAILY` quotas use session-start attribution (the `/usage`
+  caveat) and exempt markers. `HUB_CHANNEL_MAP` lanes pick a session's
+  parent channel by `spawned_by` (allowlist-gated like `DEVIN_USER_MAP` —
+  a caller-supplied `/task by:` can't redirect into someone's lane);
+  digest/inbox/monitor posts always go to the default hub.

@@ -10,6 +10,17 @@ class _Settings:
     allowed_user_id_set = {1}
     openai_api_key = ""
 
+    def is_operator(self, user_id, role_ids=()):
+        return user_id in self.allowed_user_id_set
+
+
+class _NoDb:
+    """DM intake's operator check bottoms out in the runtime table —
+    an empty one."""
+
+    async def is_allowed_user(self, uid):
+        return False
+
 
 class _Att:
     def __init__(self, url, content_type="image/png", waveform=None):
@@ -55,6 +66,7 @@ def _bot(monkeypatch, spawned, **settings_kw):
     settings = type("S", (_Settings,), settings_kw)()
     bot = DevinMobileBot.__new__(DevinMobileBot)
     bot.settings = settings
+    bot.db = _NoDb()
     bot.github = None
     spawns: list[dict] = []
 

@@ -85,6 +85,7 @@ class _Relay:
 class _Settings:
     allowed_user_id_set = {1}
     create_as_user_id = None
+    admin_user_id_set = frozenset()
 
 
 class _Bot:
@@ -113,7 +114,7 @@ def _binding(**kw) -> Binding:
 async def test_thumbs_up_on_anchor_sends_approval(tmp_path):
     bot = await _bot(tmp_path, _binding())
     msg = _Msg(100)  # the anchor
-    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "👍")
+    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "👍", 1)
     assert bot.devin.sent == [("s1", "Approved — please proceed.")]
     assert bot.relay.polls == ["s1"]
     assert bot.relay.progress.thinking_calls == 1
@@ -126,7 +127,7 @@ async def test_thumbs_up_on_pr_card_approves(tmp_path):
         owner="o", repo="r", number=9, card_msg_id=200,
     ))
     msg = _Msg(200)
-    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "👍")
+    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "👍", 1)
     assert bot.github.approved  # approve_pr got the PullRef
     assert bot.github.approved[0].key == "o/r#9"
     assert any("approved" in s for s in msg.channel.sent)
@@ -134,7 +135,7 @@ async def test_thumbs_up_on_pr_card_approves(tmp_path):
 
 async def test_repeat_on_anchor_polls(tmp_path):
     bot = await _bot(tmp_path, _binding())
-    await DevinMobileBot._handle_reaction(bot, _binding(), _Msg(100), "🔁")
+    await DevinMobileBot._handle_reaction(bot, _binding(), _Msg(100), "🔁", 1)
     assert bot.relay.polls == ["s1"]
 
 
@@ -144,7 +145,7 @@ async def test_repeat_on_pr_card_refreshes(tmp_path):
         session_id="s1", pr_url="https://github.com/o/r/pull/9",
         owner="o", repo="r", number=9, card_msg_id=200,
     ))
-    await DevinMobileBot._handle_reaction(bot, _binding(), _Msg(200), "🔁")
+    await DevinMobileBot._handle_reaction(bot, _binding(), _Msg(200), "🔁", 1)
     assert bot.relay.polled_pr is not None
     assert bot.relay.polled_pr.number == 9
 
@@ -152,7 +153,7 @@ async def test_repeat_on_pr_card_refreshes(tmp_path):
 async def test_repeat_resends_failed_message(tmp_path):
     bot = await _bot(tmp_path, _binding())
     msg = _Msg(300, content="fix the flake", reactions=[_Reaction("❌", me=True)])
-    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "🔁")
+    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "🔁", 1)
     assert bot.devin.sent == [("s1", "fix the flake")]
     assert "✅" in msg.added and "❌" in msg.removed
 
@@ -160,7 +161,7 @@ async def test_repeat_resends_failed_message(tmp_path):
 async def test_repeat_on_normal_message_noops(tmp_path):
     bot = await _bot(tmp_path, _binding())
     msg = _Msg(300, content="just chatter")
-    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "🔁")
+    await DevinMobileBot._handle_reaction(bot, _binding(), msg, "🔁", 1)
     assert not bot.devin.sent and not bot.relay.polls
 
 
@@ -168,7 +169,7 @@ async def test_pause_parks_binding(tmp_path):
     binding = _binding()
     bot = await _bot(tmp_path, binding)
     msg = _Msg(100)
-    await DevinMobileBot._handle_reaction(bot, binding, msg, "⏸️")
+    await DevinMobileBot._handle_reaction(bot, binding, msg, "⏸️", 1)
     stored = await bot.db.get_binding("s1")
     assert stored is not None and not stored.active
     assert any("parked" in s for s in msg.channel.sent)

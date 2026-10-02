@@ -97,6 +97,10 @@ from notes/PRs with no session activity in 7d). `/schedule kind:inbox
 every:1d` posts the card to the hub channel daily — the morning
 touchpoint.
 
+`/inbox mine:yes` filters the session-derived sections (waiting, errored,
+pending chains) to things *you* spawned — monitors and open PRs stay
+shared since they're team infra, not a personal queue.
+
 ### `/continue`
 
 Run inside a finished/errored/suspended session's thread: spawns a fresh
@@ -185,7 +189,8 @@ respawns, and label-triggered spawns all see them):
   `pytest -x`" or "use pnpm, not npm". Inside a session thread `repo:`
   defaults to that session's repo; elsewhere it's required.
 - `/notes [repo:]` — ephemeral list (`#id · repo · text`, newest 20).
-- `/unnote id:N` — delete by id, same as `/unschedule`.
+- `/unnote id:N` — delete by id (owner-or-admin when `TEAM_ADMIN_IDS`
+  is configured, same as `/unschedule`).
 
 Caps: 8 notes per repo (newest win), ~2k chars per injected block. The
 write-back half is automatic — when a session completes with
@@ -195,7 +200,9 @@ write-back half is automatic — when a session completes with
 
 ### `/schedules` / `/unschedule <id>`
 
-List recurring tasks (next run, interval, state) / delete one.
+List recurring tasks (next run, interval, state) / delete one. Deleting
+someone else's schedule needs owner-or-admin when `TEAM_ADMIN_IDS` is
+configured.
 
 ### `/sessions`
 
@@ -206,7 +213,19 @@ and a link to each thread.
 
 Parks a session: stops tracking, archives the thread, posts a marker.
 Defaults to the current thread's session when run inside one. Also tries a
-v3 `DELETE` (undocumented — best-effort to stop ACU burn sooner).
+v3 `DELETE` (undocumented — best-effort to stop ACU burn sooner). When
+`TEAM_ADMIN_IDS` is configured, parking *someone else's* session needs
+owner-or-admin — marker-spawned sessions (`github`, `intake`) stay
+shared.
+
+### `/allow <user>` / `/deny <user>`
+
+Runtime allowlist — grants/revokes operator access without an env edit or
+restart (the `allowed_users` db table unions with `ALLOWED_USER_IDS` and
+`REQUIRED_ROLE_ID` at the gate). Both commands refuse unless
+`TEAM_ADMIN_IDS` is configured **and** the caller is in it — without
+admins, operators could self-escalate. `/deny` only removes the runtime
+row; env-allowlisted or role-based access isn't affected.
 
 ### `/usage`
 
