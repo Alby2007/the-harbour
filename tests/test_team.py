@@ -362,11 +362,12 @@ class _Resp:
 
 
 class _Ix:
-    def __init__(self, uid=1, channel=None, fetch_channel=None):
+    def __init__(self, uid=1, channel=None, fetch_channel=None, guild=None):
         self.user = type("U", (), {"id": uid})()
         self.response = _Resp()
         self.followup = _Resp()
         self.channel = channel
+        self.guild = guild
 
         async def _fetch(cid):
             return None
@@ -382,6 +383,7 @@ def _cmd_bot(db, admins=frozenset({9}), allowed=None):
         "S", (), {
             "allowed_user_id_set": allowed if allowed is not None else {1, 2, 9},
             "admin_user_id_set": admins,
+            "required_role_id": None,
             "github_enabled": False,
             "is_operator": (
                 lambda self, uid, role_ids=():
@@ -549,6 +551,34 @@ async def test_allow_refuses_without_admins(tmp_path):
     )
     assert "No admins configured" in ix.response.sent[0]
     assert not await db.is_allowed_user(77)
+
+
+async def test_deny_warns_when_role_still_grants(tmp_path):
+    """/deny only touches the runtime table — a role-granted user keeps
+    access, so the reply must say so or the admin walks away wrong."""
+    db = await _db(tmp_path)
+    await db.add_allowed_user(77, added_by=9)
+    bot = _cmd_bot(db, admins=frozenset({9}))
+    bot.settings.required_role_id = 55
+
+    member = type(
+        "M", (), {"id": 77, "roles": [type("R", (), {"id": 55})()]}
+    )()
+    guild = SimpleNamespace(get_member=lambda _uid: member)
+    ix = _Ix(uid=9, guild=guild)
+    await bot.tree.commands["deny"](
+        ix, user=type("U", (), {"id": 77, "mention": "<@77>"})()
+    )
+    assert "Removed" in ix.response.sent[0]
+    assert "guild role" in ix.response.sent[0]
+
+    # no guild context (DM) → no crash, plain removal text
+    await db.add_allowed_user(78, added_by=9)
+    ix = _Ix(uid=9, guild=None)
+    await bot.tree.commands["deny"](
+        ix, user=type("U", (), {"id": 78, "mention": "<@78>"})()
+    )
+    assert ix.response.sent[0].startswith("Removed")
 
 
 # ---- Phase G: /inbox mine: ---------------------------------------------------------

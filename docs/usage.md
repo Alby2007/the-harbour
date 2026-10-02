@@ -260,7 +260,8 @@ Body: `prompt` (required, ≤4000 chars), `repo` (string or array,
 comma-separate works), `title`, `budget` (ACU cap), `attachments` (array
 of ≤8 `http(s)://` URLs, each ≤2048 chars — they must be publicly
 fetchable by Devin), `by` (optional caller name ≤64 chars — becomes the
-session's `spawned_by`, so a Discord snowflake pings that user).
+session's `spawned_by`, so a Discord snowflake pings that user — numeric
+values must be an allowlisted id, else `400`).
 Success → `200` with `session_id`, `thread_id`, `session_url`, and
 `thread_url` — the Discord deep-link is what makes a Shortcut useful
 (tap → lands in the live thread). Errors: `401` bad/missing token, `400`

@@ -360,13 +360,13 @@ class DevinMobileBot(discord.Client):
     _REACT_EMOJI = frozenset({"👍", "🔁", "⏸️"})
 
     async def on_raw_reaction_add(self, event: discord.RawReactionActionEvent) -> None:
+        emoji = event.emoji.name or ""
+        if emoji not in self._REACT_EMOJI:
+            return  # cheap filter first — the operator check hits the db
         # event.member is a Member in guilds, None in DMs (id-only there)
         if not await _is_operator(
             self, event.user_id, user_role_ids(event.member)
         ):
-            return
-        emoji = event.emoji.name or ""
-        if emoji not in self._REACT_EMOJI:
             return
         binding = await self.db.get_binding_by_thread(event.channel_id)
         if binding is None:

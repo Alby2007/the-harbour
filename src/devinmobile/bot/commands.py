@@ -1069,4 +1069,12 @@ def register_commands(bot: "DevinMobileBot") -> None:
         )
         if user.id in bot.settings.allowed_user_id_set:
             msg += " (Still allowlisted via `ALLOWED_USER_IDS`.)"
+        elif (
+            bot.settings.required_role_id
+            and interaction.guild is not None
+            and (m := interaction.guild.get_member(user.id)) is not None
+            and bot.settings.required_role_id
+            in (r.id for r in m.roles)
+        ):
+            msg += " (Still allowed via the guild role.)"
         await interaction.response.send_message(msg, ephemeral=True)

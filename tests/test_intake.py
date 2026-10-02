@@ -14,6 +14,7 @@ class _Settings:
     task_intake_token = "tok123"
     task_intake_token_map = {"mapA": "alby", "mapB": "sam"}
     github_user_id_map: dict = {}
+    allowed_user_id_set = {1}
     github_enabled = False
 
 
@@ -213,6 +214,27 @@ async def test_task_by_field_under_single_token(monkeypatch):
                 json={"prompt": "x", "by": bad},
             )
             assert status == 400, bad
+    finally:
+        await srv.stop()
+
+
+async def test_task_by_snowflake_needs_allowlist(monkeypatch):
+    """A digit `by:` claims a Discord identity — only allowlisted ids pass;
+    junk digits would mint fresh ACU quota buckets / charge someone else's."""
+    srv, calls = await _server(monkeypatch)
+    try:
+        port = _port(srv)
+        # allowlisted snowflake — the documented Shortcut-owner flow
+        status, _ = await _post(port, "/task", token="tok123",
+                                json={"prompt": "x", "by": "1"})
+        assert status == 200
+        assert calls[0]["spawned_by"] == "1"
+        # a digit that isn't an allowlisted id → 400, not attribution
+        status, body = await _post(port, "/task", token="tok123",
+                                   json={"prompt": "x", "by": "999"})
+        assert status == 400
+        assert "allowlisted" in body.get("error", "")
+        assert len(calls) == 1  # nothing spawned
     finally:
         await srv.stop()
 

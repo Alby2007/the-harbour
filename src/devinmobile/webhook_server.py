@@ -167,7 +167,20 @@ class WebhookServer:
             if by is not None:
                 if not isinstance(by, str) or not by.strip() or len(by) > 64:
                     return web.Response(status=400)
-                spawned_by = by.strip()
+                by = by.strip()
+                # A digit `by:` claims a Discord identity — only honor it
+                # when it's an allowlisted id (the same gate pings/lanes/
+                # create_as use). Anything else would mint a fresh ACU
+                # quota bucket per junk id — or charge somebody else's.
+                if by.isdigit() and (
+                    int(by) not in self.bot.settings.allowed_user_id_set
+                ):
+                    return web.json_response(
+                        {"error": "by: a numeric value must be an "
+                                  "allowlisted Discord id"},
+                        status=400,
+                    )
+                spawned_by = by
         from .spawn import SpawnError, spawn_session  # local: import cycle
 
         try:

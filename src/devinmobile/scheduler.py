@@ -79,7 +79,16 @@ class Scheduler:
                 await self.bot.db.schedule_ran(s.id, session.session_id, now)
             except SpawnError as e:
                 log.warning("schedule #%d spawn failed: %s", s.id, e)
-                # still advance — a broken schedule shouldn't retry every tick
+                # still advance — a broken schedule shouldn't retry every
+                # tick; but surface the skip — a quota-blocked or
+                # misconfigured schedule failing silently looks identical
+                # to "nothing due" for the row's owner
+                try:
+                    await self._post_hub(
+                        f"⛔ Scheduled task #{s.id} skipped — {e}"
+                    )
+                except Exception:
+                    pass  # the row already advanced; the log line is enough
                 await self.bot.db.schedule_ran(s.id, "", now)
             except Exception:
                 log.exception("schedule #%d spawn crashed", s.id)

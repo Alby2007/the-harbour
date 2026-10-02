@@ -233,3 +233,30 @@ async def test_spawn_schedule_still_spawns(tmp_path, monkeypatch):
     monkeypatch.setattr(sched_mod, "spawn_session", _fake_spawn)
     await Scheduler(_SchedBot(db))._fire_due()  # type: ignore[arg-type]
     assert (await db.all_schedules())[0].last_session_id == "sx"
+
+
+async def test_spawn_schedule_failure_posts_hub_notice(
+    tmp_path, monkeypatch
+):
+    """A SpawnError (quota, missing hub config) still advances the row —
+    and now posts a hub notice so the owner sees the skip instead of
+    'nothing due'."""
+    from devinmobile.spawn import SpawnError
+
+    db = await _db(tmp_path)
+    now = int(time.time())
+    row = ScheduleRow(
+        id=0, prompt="do thing", interval_seconds=3600,
+        next_run_at=now - 10,
+    )
+    row.id = await db.add_schedule(row)
+
+    async def _boom(bot, **kw):
+        raise SpawnError("daily ACU quota 5 reached")
+
+    monkeypatch.setattr(sched_mod, "spawn_session", _boom)
+    bot = _SchedBot(db)
+    await Scheduler(bot)._fire_due()  # type: ignore[arg-type]
+    texts = [str(a[0]) for a, _ in bot.hub.sent if a]
+    assert any("skipped" in t and "quota" in t for t in texts), texts
+    assert (await db.all_schedules())[0].next_run_at > now
