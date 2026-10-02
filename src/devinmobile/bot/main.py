@@ -136,7 +136,9 @@ class DevinMobileBot(discord.Client):
             await self._dm_intake(message)
             return
         binding = await self.db.get_binding_by_thread(message.channel.id)
-        if binding is None:
+        # a deleted session's thread (or a non-thread channel message) is
+        # inert — a stray reply must not reactivate a deleted binding
+        if binding is None or binding.deleted:
             return
         if not await _is_operator(
             self, message.author.id, user_role_ids(message.author)

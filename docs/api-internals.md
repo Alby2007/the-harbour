@@ -16,6 +16,8 @@ Desktop) — the ACP details are empirical and could shift between releases.
 | `POST /sessions/{id}/messages` | steer | `{"message": ...}`; auto-resumes suspended sessions; supports `attachment_urls`, `message_as_user_id`. Needs `ManageOrgSessions` |
 | `GET /sessions` | list | Response is `{"items": [...]}`. Only lists v3-created sessions — bridge/Desktop/CLI sessions appear only after their first prompt |
 | `GET /organizations/{org}/members` | find `user-...` for attribution | Requires `ViewOrgMembers`-ish scope; works with Admin service key |
+| `DELETE /sessions/{id}` | `/kill` `/delete` | **Verified** (probe_admin.py): `200` + the session body — but a follow-up GET still `200`s: delete **terminates the run**, it does NOT erase the record. The session may show `running` briefly after as the VM winds down |
+| `PATCH /sessions/{id}` | rename | **405 Method Not Allowed** (probe_admin.py) — no REST rename exists |
 
 Devin messages can embed `ATTACHMENT:{json}` markers inline — the relay strips
 them and relays `url` as a link.
@@ -137,11 +139,15 @@ results against a throwaway session:
 | `session/set_mode` | `Method not found` (-32601); `setMode`/`setSessionMode` same; `set_config_option configId="mode"` → `Unknown configId` (-32602). No `availableModes`/`currentModeId` anywhere → **no per-session mode switching on this build** |
 | `cognition.ai/userShellCommand` | **Advertised** `true` in `initialize` `agentCapabilities._meta` but unreachable: rejected as a `prompt` content block (-32602 — the prompt union only accepts text/image/audio/resource_link/resource), `-32601` as a standalone method (also `_`-prefixed and `shellCommand` spellings), and **silently ignored** as a top-level `session/prompt` param (`userShellCommand` / `cognition.ai/userShellCommand`), inside a text block's `_meta`, as request `_meta`, and as a JSON-RPC notification. `echo` marker never appeared in stream updates or the v3 transcript. The capability flag exists; the route doesn't — likely gated to Cognition's own clients |
 | `cognition.ai/queuedMessages`, `cognition.ai/sessionRename`, `sessionHeartbeat`, `session/resume`, `session/close` | All `Method not found` (-32601) — `sessionRename` is likewise advertised `true` in capabilities yet unrouted |
+| `session/delete`, `cognition.ai/sessionArchiving` | Both `Method not found` (-32601, scripts/probe_admin.py) — advertised in `initialize` caps, unrouted on this build. No bridge-side delete or archive exists |
 
 Consequence: `/exec` and `/mode` are **not** built — a user shell needs an
 agent turn (normal steering text), and there is no mode surface to switch.
-If a future CLI version ships these, re-run the probe; the capability flags
-in `initialize` are the first tell.
+Session admin is likewise asymmetric: v3 `DELETE` really terminates (the
+record stays listable), while rename/archive exist nowhere on Devin's
+side — `/rename` edits the Discord thread + binding title, and "archive"
+is `thread.edit(archived=True)`. If a future CLI version ships these, re-
+run the probe; the capability flags in `initialize` are the first tell.
 
 ### Draft → materialization
 

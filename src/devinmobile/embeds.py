@@ -42,7 +42,9 @@ def status_embed(
     model: str | None = None,
     spawned_by: str = "",
 ) -> discord.Embed:
-    title = session.title or fallback_title or session.session_id
+    # binding.title (the /rename or spawn-time name) beats the session's
+    # auto-title — user intent wins, consistent with spawn-time naming
+    title = fallback_title or session.title or session.session_id
     embed = discord.Embed(
         title=title[:100],
         url=session.url,

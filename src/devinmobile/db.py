@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     chain          TEXT,
     summary        TEXT,
     spawned_by     TEXT,
+    deleted        INTEGER NOT NULL DEFAULT 0,  -- soft delete: hidden, not erased
     created_at     INTEGER NOT NULL
 );
 
@@ -132,6 +133,11 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         # who spawned it — a discord snowflake, or a marker like
         # 'github'/'intake'/a token-map name; '' = legacy/unattributed
         "spawned_by": "ALTER TABLE bindings ADD COLUMN spawned_by TEXT",
+        # /delete hides a session (the row stays for /usage + quota
+        # honesty); write-once — polls can't un-delete
+        "deleted": (
+            "ALTER TABLE bindings ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"
+        ),
     },
     "prs": {
         "auto_merge": (
@@ -243,6 +249,9 @@ class Binding:
     # a token-map name); '' = legacy/unattributed. mention_for() routes
     # pings through this: snowflake → owner ping, else all-allowlist.
     spawned_by: str = ""
+    # /delete soft-delete — hidden from /sessions + inbox, kept for /usage
+    # and quota (the ACU still burned). Write-once; nothing un-deletes.
+    deleted: bool = False
     created_at: int = 0
 
 
@@ -355,6 +364,10 @@ class Database:
                 (row["spawned_by"] or "")
                 if "spawned_by" in row.keys() else ""
             ),
+            deleted=(
+                bool(row["deleted"])
+                if "deleted" in row.keys() else False
+            ),
             created_at=row["created_at"] or 0,
         )
 
@@ -367,8 +380,8 @@ class Database:
                 status, status_detail, msg_cursor, seen_event_ids, active, model,
                 last_msg, acus, acu_warned, last_activity_at, quiet_alerted,
                 repos, continued_from, max_acu, review_of, chain, summary,
-                spawned_by, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                spawned_by, deleted, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  thread_id=excluded.thread_id, channel_id=excluded.channel_id,
                  anchor_msg_id=excluded.anchor_msg_id, title=excluded.title,
@@ -395,7 +408,11 @@ class Database:
                                   bindings.summary),
                  -- or the spawn-time owner attribution
                  spawned_by=COALESCE(NULLIF(excluded.spawned_by, ''),
-                                     bindings.spawned_by)""",
+                                     bindings.spawned_by),
+                 -- write-once: a state-only upsert (deleted=0) can't
+                 -- resurrect a deleted session
+                 deleted=CASE WHEN excluded.deleted = 1 THEN 1
+                              ELSE bindings.deleted END""",
             (
                 b.session_id, b.thread_id, b.channel_id, b.anchor_msg_id, b.title, b.url,
                 b.status, b.status_detail, b.msg_cursor,
@@ -407,7 +424,8 @@ class Database:
                 b.repos or None, b.continued_from or None, b.max_acu,
                 b.review_of or None,
                 json.dumps(b.chain) if b.chain else None,
-                b.summary or None, b.spawned_by or None, b.created_at,
+                b.summary or None, b.spawned_by or None, int(b.deleted),
+                b.created_at,
             ),
         )
         await self._conn.commit()
@@ -432,10 +450,16 @@ class Database:
         ) as cur:
             return [self._row_to_binding(r) for r in await cur.fetchall()]
 
-    async def all_bindings(self, limit: int = 25) -> list[Binding]:
-        async with self._conn.execute(
-            "SELECT * FROM bindings ORDER BY created_at DESC LIMIT ?", (limit,)
-        ) as cur:
+    async def all_bindings(
+        self, limit: int = 25, include_deleted: bool = False
+    ) -> list[Binding]:
+        """Listing feeds (/sessions) hide deleted rows; accounting feeds
+        (/usage) pass include_deleted=True — the ACU still counts."""
+        sql = "SELECT * FROM bindings"
+        if not include_deleted:
+            sql += " WHERE deleted = 0"
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        async with self._conn.execute(sql, (limit,)) as cur:
             return [self._row_to_binding(r) for r in await cur.fetchall()]
 
     async def bindings_since(self, since: int) -> list[Binding]:
@@ -557,17 +581,21 @@ class Database:
 
     async def chain_resumable(self) -> list[Binding]:
         """Completed chain-phase bindings — the resume sweep filters
-        terminal-marked/pending/already-continued rows Python-side."""
+        terminal-marked/pending/already-continued rows Python-side.
+        Deleted rows are excluded — /delete shouldn't resurrect a chain."""
         async with self._conn.execute(
             "SELECT * FROM bindings WHERE chain IS NOT NULL AND chain != ''"
             " AND status = 'exit'"
+            " AND (deleted IS NULL OR deleted = 0)"
         ) as cur:
             return [self._row_to_binding(r) for r in await cur.fetchall()]
 
     async def chained_bindings(self, limit: int = 25) -> list[Binding]:
-        """All bindings carrying chain state — backs /chains."""
+        """All bindings carrying chain state — backs /chains. Deleted rows
+        are hidden like everywhere else."""
         async with self._conn.execute(
             "SELECT * FROM bindings WHERE chain IS NOT NULL AND chain != ''"
+            " AND (deleted IS NULL OR deleted = 0)"
             " ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ) as cur:
@@ -586,12 +614,15 @@ class Database:
     async def binding_for_pr(
         self, owner: str, repo: str, number: int
     ) -> tuple[Binding, PrRow] | None:
-        """Reverse lookup for webhooks: PR identity → (binding, pr row)."""
+        """Reverse lookup for webhooks: PR identity → (binding, pr row).
+        Deleted sessions are skipped — their PR events shouldn't post
+        into an archived thread."""
         async with self._conn.execute(
             """SELECT b.*, p.* FROM prs p JOIN bindings b
                  ON b.session_id = p.session_id
                WHERE lower(p.owner) = lower(?) AND lower(p.repo) = lower(?)
-                 AND p.number = ?""",
+                 AND p.number = ?
+                 AND (b.deleted IS NULL OR b.deleted = 0)""",
             (owner, repo, number),
         ) as cur:
             row = await cur.fetchone()
@@ -703,8 +734,9 @@ class Database:
         do the sectioning — the query is deliberately broad."""
         async with self._conn.execute(
             """SELECT * FROM bindings
-               WHERE active = 1 OR status = 'error'
-                  OR (chain IS NOT NULL AND chain != '')
+               WHERE (deleted IS NULL OR deleted = 0)
+                 AND (active = 1 OR status = 'error'
+                      OR (chain IS NOT NULL AND chain != ''))
                ORDER BY created_at DESC"""
         ) as cur:
             return [self._row_to_binding(r) for r in await cur.fetchall()]

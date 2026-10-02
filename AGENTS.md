@@ -285,3 +285,12 @@ Discord bot front-end for Devin Cloud sessions (v3 REST API,
   parent channel by `spawned_by` (allowlist-gated like `DEVIN_USER_MAP` —
   a caller-supplied `/task by:` can't redirect into someone's lane);
   digest/inbox/monitor posts always go to the default hub.
+- Session admin (probed by `scripts/probe_admin.py`, recorded in
+  api-internals.md): v3 `DELETE` really terminates (200, but the record
+  stays listable — it's a stop, not an erase); `PATCH` is 405 and bridge
+  `session/delete`/`sessionArchiving` are -32601, so `/rename` is
+  Discord-side (thread + `binding.title`, which beats `session.title` in
+  embeds) and archive = `thread.edit(archived=True)`. `bindings.deleted`
+  is write-once soft-delete — `/sessions`+`inbox` hide it, `/usage` +
+  quota still count it, `on_message` ignores deleted bindings so a stray
+  reply can't resurrect.

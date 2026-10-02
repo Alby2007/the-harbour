@@ -212,11 +212,35 @@ and a link to each thread.
 ### `/kill [session_id]`
 
 Parks a session: stops tracking, archives the thread, posts a marker.
-Defaults to the current thread's session when run inside one. Also tries a
-v3 `DELETE` (undocumented — best-effort to stop ACU burn sooner). When
+Defaults to the current thread's session when run inside one. Also calls
+v3 `DELETE` (verified — it terminates the run, so ACU burn stops; the
+session record stays listable server-side) and reports the outcome —
+`terminated` vs the API's refusal — instead of swallowing it. When
 `TEAM_ADMIN_IDS` is configured, parking *someone else's* session needs
 owner-or-admin — marker-spawned sessions (`github`, `intake`) stay
 shared.
+
+### `/delete [session_id]`
+
+The destructive counterpart to `/kill`'s park: terminates the session
+(v3 `DELETE`, verdict reported), marks the binding `deleted` (hidden from
+`/sessions` and `/inbox` — the row stays for `/usage` and the ACU quota,
+since the burn still counts), and archives the thread. `wipe:yes` deletes
+the Discord thread entirely. Same owner-or-admin gate as `/kill`. A stray
+reply in a deleted session's thread won't reactivate it — `on_message`
+ignores deleted bindings.
+
+There's no `/archive` — archiving is `thread.edit(archived=True)`, which
+already rides `/kill` and `/delete`; a standalone archive would only
+mean "invisible but still burning."
+
+### `/rename <title> [session_id]`
+
+Renames a session Discord-side: the thread title plus the binding's title
+(which now wins over Devin's auto-title in status/completion embeds).
+Devin has no rename API — v3 `PATCH` is 405 and the bridge's
+`sessionRename` is unrouted (probed) — so the web app's title is
+unchanged; the name is local to the bot.
 
 ### `/allow <user>` / `/deny <user>`
 

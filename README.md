@@ -86,6 +86,9 @@ approval → anything you type in the thread steers the session.
   ACU quotas, `TEAM_ADMIN_IDS` owner-or-admin gates on destructive ops,
   `HUB_CHANNEL_MAP` per-user thread lanes, `/allow` `/deny` runtime
   allowlist, `/inbox mine:`
+- **Session admin** — `/kill` reports what the v3 `DELETE` actually did,
+  `/delete` hides a session from lists (ACU still counts; `wipe:` clears
+  the thread), `/rename` retitles the thread + binding
 - **Presence** — the bot's Discord status shows `N Devin sessions running`
 - **Diff-on-phone** — completion cards attach the PR's `.diff` file so the
   actual change is readable without opening GitHub

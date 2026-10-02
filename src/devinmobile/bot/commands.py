@@ -913,12 +913,17 @@ def register_commands(bot: "DevinMobileBot") -> None:
             )
             return
         await interaction.response.defer(ephemeral=True)
-        # Best-effort terminate — v3 has no documented DELETE, so parking +
-        # archiving is the contract; the API call just stops ACU burn sooner.
+        # DELETE /v3/.../sessions/{id} is verified live (probe_admin.py) —
+        # it terminates the run; the record stays listable. Report the
+        # outcome instead of swallowing it.
         try:
             await bot.devin.terminate_session(binding.session_id)
-        except Exception:  # noqa: BLE001 — v3 may not support it; local park is enough
-            pass
+            verdict = "terminated"
+        except Exception as e:  # noqa: BLE001 — surface the refusal
+            verdict = (
+                f"the API refused delete ({e}) — "
+                "it'll idle-suspend on its own"
+            )
         binding.active = False
         await bot.db.upsert_binding(binding)
         thread = await interaction.client.fetch_channel(binding.thread_id)
@@ -929,7 +934,134 @@ def register_commands(bot: "DevinMobileBot") -> None:
             except discord.HTTPException:
                 pass
         await interaction.followup.send(
-            f"Parked `{binding.session_id}` and archived its thread.", ephemeral=True
+            f"Parked `{binding.session_id}` ({verdict}), archived its thread.",
+            ephemeral=True,
+        )
+
+    async def _resolve_binding(
+        interaction: discord.Interaction, session: str | None
+    ) -> Binding | None:
+        """The kill/delete/rename lookup: explicit `session:` id, else
+        the current thread's binding."""
+        if session:
+            return await bot.db.get_binding(session)
+        if isinstance(interaction.channel, discord.Thread):
+            return await bot.db.get_binding_by_thread(interaction.channel.id)
+        return None
+
+    @tree.command(
+        name="delete",
+        description="Delete a session — terminates it and hides it from "
+        "lists (the ACU still counts; `wipe:` also deletes the thread)",
+    )
+    @app_commands.describe(
+        session="Session id (default: this thread's session)",
+        wipe="Also delete the Discord thread (default: just archive it)",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def delete_cmd(
+        interaction: discord.Interaction,
+        session: str | None = None,
+        wipe: bool = False,
+    ) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        binding = await _resolve_binding(interaction, session)
+        if binding is None:
+            await interaction.response.send_message(
+                "No such session — run inside its thread or pass `session:`.",
+                ephemeral=True,
+            )
+            return
+        if not _may_destroy(
+            bot.settings, interaction.user.id, binding.spawned_by
+        ):
+            await interaction.response.send_message(
+                _OWNER_OR_ADMIN, ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        # Same verified DELETE as /kill — it terminates; the record stays
+        # listable server-side either way
+        try:
+            await bot.devin.terminate_session(binding.session_id)
+            verdict = "terminated"
+        except Exception as e:  # noqa: BLE001 — surface the refusal
+            verdict = (
+                f"the API refused delete ({e}) — "
+                "it'll idle-suspend on its own"
+            )
+        binding.deleted = True
+        binding.active = False
+        await bot.db.upsert_binding(binding)
+        thread = await interaction.client.fetch_channel(binding.thread_id)
+        wiped = False
+        if isinstance(thread, discord.Thread):
+            if wipe:
+                try:
+                    await thread.delete()
+                    wiped = True
+                except discord.HTTPException:
+                    pass
+            if not wiped:
+                await thread.send("Session deleted — no longer listed.")
+                try:
+                    await thread.edit(archived=True)
+                except discord.HTTPException:
+                    pass
+        await interaction.followup.send(
+            f"Deleted `{binding.session_id}` ({verdict})"
+            + (" — thread removed." if wiped else " — thread archived.")
+            + " It stays in /usage — the ACU burned still counts.",
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="rename",
+        description="Rename a session — Discord-side (Devin has no rename "
+        "API): thread title + binding title",
+    )
+    @app_commands.describe(
+        title="New title",
+        session="Session id (default: this thread's session)",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def rename_cmd(
+        interaction: discord.Interaction,
+        title: str,
+        session: str | None = None,
+    ) -> None:
+        if not await _allowed(interaction):
+            await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
+            return
+        title = title.strip()
+        if not title:
+            await interaction.response.send_message(
+                "Give a non-empty `title:`.", ephemeral=True
+            )
+            return
+        binding = await _resolve_binding(interaction, session)
+        if binding is None:
+            await interaction.response.send_message(
+                "No such session — run inside its thread or pass `session:`.",
+                ephemeral=True,
+            )
+            return
+        binding.title = title
+        await bot.db.upsert_binding(binding)
+        renamed = False
+        try:
+            thread = await interaction.client.fetch_channel(binding.thread_id)
+            if isinstance(thread, discord.Thread):
+                await thread.edit(name=title[:90])
+                renamed = True
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message(
+            f"Renamed to **{title[:100]}**"
+            + ("" if renamed else " (binding only — thread rename failed)"),
+            ephemeral=True,
         )
 
     @tree.command(name="usage", description="ACU burn rollup across bot sessions")
@@ -938,7 +1070,9 @@ def register_commands(bot: "DevinMobileBot") -> None:
         if not await _allowed(interaction):
             await interaction.response.send_message(NOT_ALLOWED, ephemeral=True)
             return
-        bindings = await bot.db.all_bindings(limit=1000)
+        # include_deleted — deleted sessions still burned their ACU; the
+        # accounting view counts them even though lists hide them
+        bindings = await bot.db.all_bindings(limit=1000, include_deleted=True)
         if not bindings:
             await interaction.response.send_message(
                 "No sessions yet.", ephemeral=True
